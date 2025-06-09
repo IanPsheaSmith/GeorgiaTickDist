@@ -1,0 +1,22 @@
+"","Species_Name","Species_Display","Dataset_Name","File_Name","File_Size_KB","Rows","Columns","Presence_Count","Presence_Percent","Has_SHDI","Mean_SHDI","File_Saved"
+"1","Ixodes_ricinus","Ixodes ricinus","Ixric_BRTData","Ixric_BRTData.csv",227.4,580,35,124,21.4,TRUE,0.316,TRUE
+"2","Dermacentor_reticulatus","Dermacentor reticulatus","Deret_BRTData","Deret_BRTData.csv",227.4,580,35,90,15.5,TRUE,0.316,TRUE
+"3","Dermacentor_marginatus","Dermacentor marginatus","Demar_BRTData","Demar_BRTData.csv",227.4,580,35,105,18.1,TRUE,0.316,TRUE
+"4","Haemaphysalis_parva","Haemaphysalis parva","Hapar_BRTData","Hapar_BRTData.csv",227.4,580,35,63,10.9,TRUE,0.316,TRUE
+"5","Haemaphysalis_punctata","Haemaphysalis punctata","Hapun_BRTData","Hapun_BRTData.csv",227.4,580,35,118,20.3,TRUE,0.316,TRUE
+"6","Haemaphysalis_inermis","Haemaphysalis inermis","Haine_BRTData","Haine_BRTData.csv",227.4,580,35,54,9.3,TRUE,0.316,TRUE
+"7","Rhipicephalus_bursa","Rhipicephalus bursa","Rhbur_BRTData","Rhbur_BRTData.csv",227.4,580,35,39,6.7,TRUE,0.316,TRUE
+"8","Rhipicephalus_annulatus","Rhipicephalus annulatus","Rhann_BRTData","Rhann_BRTData.csv",227.4,580,35,25,4.3,TRUE,0.316,TRUE
+"9","Rhipicephalus_rossicus","Rhipicephalus rossicus","Rhros_BRTData","Rhros_BRTData.csv",227.4,580,35,22,3.8,TRUE,0.316,TRUE
+"10","Rhipicephalus_turanicus","Rhipicephalus turanicus","Rhtur_BRTData","Rhtur_BRTData.csv",227.4,580,35,18,3.1,TRUE,0.316,TRUE
+"11","Hyalomma_marginatum","Hyalomma marginatum","Hymar_BRTData","Hymar_BRTData.csv",227.4,580,35,16,2.8,TRUE,0.316,TRUE
+"12","Haemaphysalis_sulcata","Haemaphysalis sulcata","Hasul_BRTData","Hasul_BRTData.csv",227.4,580,35,20,3.4,TRUE,0.316,TRUE
+"13","Hyalomma_aegyptium","Hyalomma aegyptium","Hyaeg_BRTData","Hyaeg_BRTData.csv",227.4,580,35,6,1,TRUE,0.316,TRUE
+"14","Rhipicephalus_sanguineus","Rhipicephalus sanguineus","Rhsan_BRTData","Rhsan_BRTData.csv",227.4,580,35,4,0.7,TRUE,0.316,TRUE
+"15","Haemaphysalis_concinna","Haemaphysalis concinna","Hacon_BRTData","Hacon_BRTData.csv",227.4,580,35,4,0.7,TRUE,0.316,TRUE
+"16","Haemaphysalis_caucasica","Haemaphysalis caucasica","Hacau_BRTData","Hacau_BRTData.csv",227.4,580,35,4,0.7,TRUE,0.316,TRUE
+"17","Haemaphysalis_erinacei","Haemaphysalis erinacei","Haeri_BRTData","Haeri_BRTData.csv",227.4,580,35,2,0.3,TRUE,0.316,TRUE
+"18","Hyalomma_impeltatum","Hyalomma impeltatum","Hyimp_BRTData","Hyimp_BRTData.csv",227.4,580,35,2,0.3,TRUE,0.316,TRUE
+"19","Ixodes_acuminatus","Ixodes acuminatus","Ixacu_BRTData","Ixacu_BRTData.csv",227.4,580,35,2,0.3,TRUE,0.316,TRUE
+"20","Rhipicephalus_pusillus","Rhipicephalus pusillus","Rhpus_BRTData","Rhpus_BRTData.csv",227.4,580,35,1,0.2,TRUE,0.316,TRUE
+"21","Hyalomma_scupense","Hyalomma scupense","Hyscu_BRTData","Hyscu_BRTData.csv",227.4,580,35,1,0.2,TRUE,0.316,TRUE
