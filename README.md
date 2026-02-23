@@ -16,7 +16,7 @@
 
 ## Overview
 
-This repository contains all data, code, and associated files for a community ecology and spatial distribution study of ticks in the country of Georgia (Caucasus). The study draws on ten years of surveillance data (2013–2023) collected across 580 unique sites to describe tick species diversity, biogeography, co-occurrence patterns, and habitat suitability using boosted regression tree (BRT) models.
+This repository contains all data, code, and associated files for a community ecology and spatial distribution study of ticks in the country of Georgia (Caucasus). The study draws on ten years of surveillance data (2013–2023) to describe tick species diversity, biogeography, co-occurrence patterns, and habitat suitability using boosted regression tree (BRT) models.
 
 **Key Features:**
 - Tick occurrence dataset spanning 216 unique collection dates across 10 years
