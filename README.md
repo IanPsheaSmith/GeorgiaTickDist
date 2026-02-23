@@ -1,6 +1,5 @@
 # Georgia Tick Ecology & Distribution Study
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![DOI](https://img.shields.io/badge/DOI-pending-blue.svg)](https://github.com/IanPsheaSmith/GeorgiaTickDist)
 
 ## Table of Contents
@@ -17,7 +16,7 @@
 
 ## Overview
 
-This repository contains all data, code, and associated files for a community ecology and spatial distribution study of medically-relevant ticks in the country of Georgia (Caucasus). The study draws on ten years of surveillance data (2013–2023) collected across 580 unique sites to describe tick species diversity, biogeography, co-occurrence patterns, and habitat suitability using boosted regression tree (BRT) models.
+This repository contains all data, code, and associated files for a community ecology and spatial distribution study of ticks in the country of Georgia (Caucasus). The study draws on ten years of surveillance data (2013–2023) collected across 580 unique sites to describe tick species diversity, biogeography, co-occurrence patterns, and habitat suitability using boosted regression tree (BRT) models.
 
 **Key Features:**
 - Tick occurrence dataset spanning 216 unique collection dates across 10 years
@@ -68,8 +67,6 @@ The primary occurrence dataset containing tick collection records from Georgia (
 - `Count`: Number of individuals collected
 - `Site`: Collection site identifier
 - Collection method metadata (flagging, dragging, dry ice traps)
-
-A total of 720 unique occurrence records representing 21 species across 5 genera were collected from 580 unique sites.
 
 ### BRT Modeling Datasets
 **Location:** `BRT_PseudoAbs_Datasets/` and `BRT_RealAbs_Datasets/`
@@ -129,7 +126,7 @@ cd GeorgiaTickDist
 ### Reproducing the Analysis
 
 1. Open `Georgia_Ticks_Biodiv.Rmd` in RStudio
-2. Install required R packages (listed in the Rmd header); primary dependencies include `dismo`, `gbm`, `ClustGeo`, `cooccur`, `iNEXT`, `vegan`, `raster`, `ggplot2`, and `sf`
+2. Install required R packages (listed in the Rmd header)
 3. Ensure all data files are in the expected relative paths (no changes needed if cloned from GitHub)
 4. Knit the document to reproduce all analyses, figures, and model outputs
 
@@ -141,28 +138,11 @@ cd GeorgiaTickDist
 - **Memory:** ≥8 GB RAM recommended for raster processing and BRT model fitting
 - **Disk space:** ~2 GB for full raster stack storage
 
-Key R packages:
-| Package | Purpose |
-|---------|---------|
-| `dismo` | Species distribution modeling (BRT) |
-| `gbm` | Generalized boosted regression models |
-| `ClustGeo` | Spatially constrained hierarchical clustering |
-| `cooccur` | Probabilistic species co-occurrence analysis |
-| `iNEXT` | Rarefaction and species diversity estimation |
-| `vegan` | Community ecology statistics |
-| `raster` / `terra` | Spatial raster analysis |
-| `sf` | Spatial vector data |
-| `ggplot2` | Visualization |
-
 ## Citation
 
-If you use this data or code in your research, please cite:
+If you use this data or code in your research, please cite (under review, not final citation):
 
 Pshea-Smith, I.A., Kotorashvili, A., Kotaria, N., Golubiani, G., Kirkitadze, G., Chunashvili, T., Shubashishvili, A., Di Paola, N., Kugelman, J., & Hulseberg, C. (in review). An ecological analysis of ticks in the Country of Georgia using ten years of surveillance data. *[Journal pending]*. DOI: pending
-
-## License
-
-This project is licensed under the MIT License.
 
 **Data Usage:** All data are freely available for use with proper attribution.
 
