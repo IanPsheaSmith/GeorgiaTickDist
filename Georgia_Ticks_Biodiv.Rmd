@@ -1,0 +1,4218 @@
+---
+title: "Georgia_Ticks_Biodiv"
+author: "Ian Pshea-Smith"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 1. INSTALL REQUIRED PACKAGES | RUN ONLY IF PACKAGES NEED INSTALLATION
+-----------------------------------------------------------------------------
+```{r PACKAGE INSTALLATION}
+
+  if (!require("pacman")) install.packages("pacman")
+    pacman::p_load(readxl, dplyr, purrr, stringr, lubridate, 
+                   ggplot2, sf, rnaturalearth, MASS, raster, 
+                   geodata, modisfast, parallel, exactextractr, 
+                   dismo, viridis, htmltools, gbm, patchwork,
+                   geodist, iNEXT, cooccur, igraph, visNetwork,
+                   ClustGeo, vegan, cluster, fpc, indicspecies,
+                   classInt, corrplot, reshape2)
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 2. DATA ACQUISITION AND INITIAL PROCESSING
+-----------------------------------------------------------------------------
+```{r DATA ACQUISITION AND INITIAL PROCESSING}
+
+  # Import tick occurrence data from GitHub repository
+      url <- "https://raw.githubusercontent.com/IanPsheaSmith/GeorgiaTickDist/main/TicksEurope_Clean.xlsx"
+      
+      # Download to temporary file
+        temp_file <- tempfile(fileext = ".xlsx")
+        download.file(url, temp_file, mode = "wb")
+      
+      # Import data from sheet 2
+        Ticks_Raw <- read_excel(temp_file, sheet = 2)
+  
+  # Data cleaning procedures
+      # Remove duplicate observations while preserving unique sample identifiers
+        Ticks_Raw <- Ticks_Raw %>%
+            distinct(across(-c(Sample_ID, Collection_ID)), .keep_all = TRUE)
+      
+      # Remove observations without spatial coordinates
+        Ticks_Raw <- Ticks_Raw %>% 
+            filter(!is.na(Latitude) & !is.na(Longitude))
+      
+      # Standardize date column names and format
+        Ticks_Raw <- Ticks_Raw %>%
+            rename(Start_Date = `Start_ Date`) %>%
+            mutate(Start_Date = as.Date(Start_Date),
+                   End_Date = as.Date(End_Date))
+  
+  # Separate data by country of collection
+      # Identify unique countries in dataset
+       unique_countries <- unique(Ticks_Raw$Country)
+      
+      # Split dataset by country
+        ticks_list <- split(Ticks_Raw, Ticks_Raw$Country)
+      
+      # Create separate dataframes for each country
+        list2env(setNames(ticks_list, paste0("Ticks_Raw_", names(ticks_list))), 
+                 envir = .GlobalEnv)
+  
+  # Convert Georgia data to spatial format
+      # Create spatial points from coordinate data (WGS84 projection)
+        Ticks_Georgia <- Ticks_Raw_Georgia %>%
+            st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+      
+      # Import Georgia administrative boundary
+        Georgia_Boundary <- ne_countries(scale = "medium", country = "Georgia", 
+                                        returnclass = "sf")
+        
+      # Limit analysis to points within national boundary
+        Ticks_Georgia <- st_intersection(Ticks_Georgia, Georgia_Boundary)
+      
+      # Visualize sampling locations
+        ggplot() +
+            geom_sf(data = Georgia_Boundary, fill = "white", color = "black") +
+            geom_sf(data = Ticks_Georgia, color = "black", alpha = 0.7) +
+            theme_minimal() +
+            labs(title = "Tick Collection Sites in Georgia")
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 3. SPECIES-SPECIFIC DATASET CREATION
+-----------------------------------------------------------------------------
+```{r SPECIES-SPECIFIC DATASET CREATION}
+
+  # Define focal tick species for analysis
+      species_list <- c(
+          "Ixodes ricinus", "Dermacentor reticulatus", "Dermacentor marginatus",
+          "Haemaphysalis parva", "Haemaphysalis punctata", "Haemaphysalis inermis",
+          "Rhipicephalus bursa", "Rhipicephalus annulatus", "Rhipicephalus rossicus",
+          "Rhipicephalus turanicus", "Hyalomma marginatum", "Haemaphysalis sulcata",
+          "Hyalomma aegyptium", "Rhipicephalus sanguineus", "Haemaphysalis concinna",
+          "Haemaphysalis caucasica", "Haemaphysalis erinacei", "Hyalomma impeltatum",
+          "Ixodes acuminatus", "Rhipicephalus pusillus", "Hyalomma scupense"
+      )
+  
+  # Create standardized species identifiers for file naming
+      clean_names <- setNames(gsub("[^A-Za-z0-9]+", "_", species_list), species_list)
+  
+  # Generate spatial presence/absence datasets for each species
+      spatial_species_PA_datasets <- map(
+          setNames(species_list, clean_names),
+          function(species) {
+              # Extract genus and species components
+              name_parts <- strsplit(species, " ")[[1]]
+              genus <- name_parts[1]
+              specific_epithet <- name_parts[2]
+              
+              # Determine presence/absence at each sampling location
+              Ticks_Georgia %>%
+                  group_by(geometry) %>%
+                  summarise(
+                      # Record presence (1) if species was found at this location
+                      Presence = as.integer(any(Genus == genus & Species == specific_epithet)),
+                      .groups = "drop"
+                  ) %>%
+                  dplyr::select(Presence, geometry)
+          }
+      )
+  
+  # Construct a combined multi-species dataset
+      # Initialize with first species
+        first_species <- names(spatial_species_PA_datasets)[1]
+        combined_spatial_data <- spatial_species_PA_datasets[[first_species]] %>%
+            rename(!!first_species := Presence)
+      
+      # Add remaining species sequentially
+        remaining_species <- names(spatial_species_PA_datasets)[-1]
+        combined_spatial_data <- reduce(
+            remaining_species,
+            function(combined_df, species_name) {
+                # Extract presence values for current species
+                  presence_values <- spatial_species_PA_datasets[[species_name]] %>%
+                      st_drop_geometry() %>%
+                      dplyr::pull(Presence)
+                
+                # Add as new column to combined dataset
+                  combined_df %>% 
+                      mutate(!!species_name := presence_values)
+            },
+            .init = combined_spatial_data
+        )
+  
+  # Calculate prevalence statistics for each species
+      species_summary <- map_df(
+          names(spatial_species_PA_datasets),
+          function(species_name) {
+              data <- spatial_species_PA_datasets[[species_name]]
+              presence_count <- sum(data$Presence)
+              total_count <- nrow(data)
+              
+              tibble(
+                  Species = names(which(clean_names == species_name)),
+                  Presences = presence_count,
+                  Total = total_count,
+                  Percentage = round(100 * presence_count / total_count, 1)
+              )
+          }
+      )
+      
+      # Display species prevalence data
+        print(species_summary)
+  
+  # Generate species-specific presence-only datasets for modeling
+      presence_only_datasets <- map(
+          names(spatial_species_PA_datasets),
+          function(species_name) {
+              # Filter to presence records only
+                spatial_species_PA_datasets[[species_name]] %>%
+                    filter(Presence == 1) %>%
+                  # Retain taxonomic information
+                    mutate(species = names(which(clean_names == species_name)))
+          }
+      )
+      
+      # Name each dataset consistently
+        names(presence_only_datasets) <- names(spatial_species_PA_datasets)
+  
+  # Summarize presence-only datasets
+      presence_summary <- map_df(
+          names(presence_only_datasets),
+          function(species_name) {
+              data <- presence_only_datasets[[species_name]]
+              
+              tibble(
+                  Species = names(which(clean_names == species_name)),
+                  Presence_Points = nrow(data)
+              )
+          }
+      )
+      
+      # Display presence dataset summary
+        cat("\nPresence-Only Dataset Summary:\n")
+        print(presence_summary)
+  
+  # Export individual presence datasets to global environment for further analysis
+      invisible(
+          map2(
+              names(presence_only_datasets),
+              presence_only_datasets,
+              function(name, dataset) {
+                  # Create descriptive object name
+                    object_name <- paste0(name, "_presence")
+                  
+                  # Export to global environment
+                    assign(object_name, dataset, envir = .GlobalEnv)
+                  
+                  # Return name reference
+                    object_name
+              }
+          )
+      )
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 4. FIGURE 1: TICK SAMPLING LOCATIONS AND DENSITY MAP FOR GEORGIA
+-----------------------------------------------------------------------------
+```{r FIGURE 1: TICK SAMPLING LOCATIONS AND DENSITY MAP FOR GEORGIA}
+
+    # Prepare tick location data for kernel density estimation
+        # Extract spatial coordinates for analysis
+          coords <- st_coordinates(Ticks_Georgia)
+        
+        # Create weighted dataset based on tick count at each location
+          Ticks_Georgia_Expanded <- Ticks_Georgia[rep(1:nrow(Ticks_Georgia), Ticks_Georgia$Vector.Count), ]
+          coords <- st_coordinates(Ticks_Georgia_Expanded)
+    
+    # Define spatial extent for density estimation
+        # Obtain Georgia's geographic boundaries
+          georgia_bbox <- st_bbox(Georgia_Boundary)
+        
+        # Create density estimation grid
+          kde_x_range <- seq(georgia_bbox$xmin, georgia_bbox$xmax, length.out = 1000)
+          kde_y_range <- seq(georgia_bbox$ymin, georgia_bbox$ymax, length.out = 1000)
+    
+    # Calculate kernel density estimate
+        kde <- kde2d(
+            x = coords[,1], 
+            y = coords[,2], 
+            h = c(bandwidth.nrd(coords[,1]), bandwidth.nrd(coords[,2])),
+            n = c(1000, 1000),
+            lims = c(georgia_bbox$xmin, georgia_bbox$xmax, georgia_bbox$ymin, georgia_bbox$ymax)
+        )
+    
+    # Convert kernel density to geospatial format
+        # Transform to raster
+          kde_raster <- raster::raster(kde)
+        
+        # Constrain to Georgia's administrative boundary
+          kde_raster_cropped <- mask(crop(kde_raster, Georgia_Boundary), Georgia_Boundary)
+        
+        # Convert to dataframe for visualization
+          kde_df <- as.data.frame(raster::rasterToPoints(kde_raster_cropped))
+          colnames(kde_df) <- c("Longitude", "Latitude", "Density")
+    
+    # Create main tick distribution map
+        KDEMap <- ggplot() +
+            # Add Georgia boundary
+              geom_sf(data = Georgia_Boundary, fill = "gray90", color = "black") +
+            # Add density surface
+              geom_tile(data = kde_df, aes(x = Longitude, y = Latitude, fill = Density), alpha = 0.7) +
+              scale_fill_viridis_c(option = "viridis", name = "Tick Density") +
+            # Add sampling points
+              geom_sf(data = Ticks_Georgia, color = "black", alpha = 1, size = 1) +
+            # Format plot aesthetics
+              theme_minimal() +
+              labs(title = "", x = "", y = "")
+    
+    # Create inset map showing regional context
+        # Obtain geographic data for Caucasus region
+          world <- ne_countries(scale = "medium", returnclass = "sf")
+        
+        # Define countries in the Caucasus region
+          caucasus_countries <- c("Georgia", "Armenia", "Azerbaijan", "Russia", "Turkey", "Iran")
+          caucasus <- world[world$name %in% caucasus_countries, ]
+          georgia <- world[world$name == "Georgia", ]
+        
+        # Create regional context map
+          caucasus_map <- ggplot() +
+              # Add surrounding countries
+                geom_sf(data = caucasus, fill = "grey90", color = "black", size = 0.3) +
+              # Highlight Georgia
+                geom_sf(data = georgia, fill = "#754680", color = "black", size = 0.3) +
+              # Set appropriate geographic extent
+                coord_sf(
+                    xlim = c(38, 50),
+                    ylim = c(37, 45)
+                ) +
+              # Remove unnecessary elements
+                theme_void() +
+                theme(
+                    legend.position = "none",
+                    #plot.margin = margin(0, 0, 0, 0),
+                    panel.background = element_rect(fill = "white")
+              )
+    
+    # Display Figure 1
+        print(KDEMap)
+        print(caucasus_map)
+        # Inset map & Titling created using InkScape or MS PowerPoint
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 5. FIGURE 2 & TABLE 1 | COUNTS & BIODIVERSITY SUMMARY
+-----------------------------------------------------------------------------
+```{r FIGURE 2 & TABLE 1}
+
+# ==============================================================================
+# STEP 1: CREATE WHITTAKER RANK-ABUNDANCE PLOT
+# ==============================================================================
+    
+    # Generate enhanced Whittaker plot with raw count overlay
+        Figure2 <- presence_summary %>%
+            arrange(desc(Presence_Points)) %>%
+            mutate(
+                rank = row_number(),
+                log_abundance = log10(Presence_Points),
+                genus = str_extract(Species, "^\\w+")
+            ) %>%
+            ggplot(aes(x = rank)) +
+                # Background bars showing raw occurrence counts
+                    geom_col(
+                        aes(y = Presence_Points), 
+                        alpha = 0.4, 
+                        fill = "#21908c", 
+                        color = "#21908c",
+                        width = 0.6
+                    ) +
+                # Whittaker curve overlay (log-transformed smoothed line)
+                    geom_smooth(
+                        aes(y = 10^log_abundance), 
+                        method = "loess", 
+                        span = 0.4,
+                        color = "#218e59", 
+                        size = 1.5, 
+                        se = FALSE,
+                        alpha = 0.8
+                    ) +
+                # Data points colored by genus
+                    geom_point(
+                        aes(y = 10^log_abundance, fill = genus), 
+                        size = 4, 
+                        shape = 21,
+                        color = "#218e59",
+                        stroke = 1.2
+                    ) +
+                # Color scheme and axis formatting
+                    scale_fill_viridis_d(
+                        option = "viridis", 
+                        name = "Genus"
+                    ) +
+                    scale_y_continuous(
+                        name = "Number of Presence Records",
+                        breaks = c(0, 25, 50, 75, 100, 125),
+                        sec.axis = sec_axis(
+                            trans = ~ log10(. + 1),
+                            name = "Log(Records + 1)",
+                            breaks = log10(c(1, 10, 25, 50, 100, 125) + 1),
+                            labels = round(log10(c(1, 10, 25, 50, 100, 125) + 1), 1)
+                        )
+                    ) +
+                # Labels and theme
+                    labs(
+                        title = "Georgia Tick Species: Raw Abundance vs. Log-Rank Pattern",
+                        subtitle = "Bars show raw counts | Green curve and points show classic Whittaker relationship",
+                        x = "Species Rank"
+                    ) +
+                    theme_minimal() +
+                    theme(
+                        panel.grid.minor = element_blank(),
+                        plot.title = element_text(face = "bold"),
+                        axis.title.y.right = element_text(color = "#218e59"),
+                        axis.text.y.right = element_text(color = "#218e59", size = 9),
+                        legend.position = "bottom"
+                    )
+  
+# ==============================================================================
+# STEP 2: CALCULATE SPECIES-LEVEL DIVERSITY COMPONENTS
+# ==============================================================================
+  
+    # Calculate individual species contributions to diversity metrics
+        species_diversity <- presence_summary %>%
+            mutate(
+                # Proportional abundance for each species
+                    prop_abundance = Presence_Points / sum(Presence_Points),
+                
+                # Abundance rank (highest to lowest)
+                    abundance_rank = rank(-Presence_Points, ties.method = "min"),
+                
+                # Shannon diversity component for each species
+                # CORRECTED: Fixed variable consistency error
+                    shannon_component = ifelse(prop_abundance > 0, 
+                                               -prop_abundance * log(prop_abundance), 0),
+                
+                # Simpson dominance component for each species (original Simpson λ)
+                    simpson_component = prop_abundance^2
+            ) %>%
+            arrange(desc(Presence_Points))
+  
+# ==============================================================================
+# STEP 3: COMPUTE COMMUNITY-LEVEL DIVERSITY INDICES
+# ==============================================================================
+  
+    # Calculate actual number of species present (not dataset rows)
+        S <- sum(species_diversity$prop_abundance > 0)
+    
+    # Calculate comprehensive community diversity metrics
+        community_metrics <- list(
+            # Basic abundance measures
+                total_abundance = sum(species_diversity$Presence_Points),
+                species_richness = S,  
+            
+            # Shannon diversity family
+                shannon_diversity = sum(species_diversity$shannon_component),
+                shannon_evenness = sum(species_diversity$shannon_component) / log(S),
+            
+            # Simpson diversity family (using original Simpson nomenclature)
+                simpson_dominance = sum(species_diversity$simpson_component),     # Original Simpson λ
+                gini_simpson = 1 - sum(species_diversity$simpson_component),      # Gini-Simpson (1-λ)
+                simpson_evenness = (1 / sum(species_diversity$simpson_component)) / S,
+            
+            # Dominance measures
+                berger_parker = max(species_diversity$prop_abundance),
+            
+            # Hill numbers (effective species diversity)
+                hill_q0 = S,                                                      # Species richness
+                hill_q1 = exp(sum(species_diversity$shannon_component)),          # Shannon effective species
+                hill_q2 = 1 / sum(species_diversity$simpson_component)            # Simpson effective species
+        )
+    
+    # Display community metrics with clarified Simpson terminology
+        cat("Community-level Diversity Metrics:\n")
+        cat("Note: Using corrected formulations with proper Simpson nomenclature\n")
+        print(community_metrics)
+  
+# ==============================================================================
+# STEP 4: CLASSIFY SPECIES BY DOMINANCE PATTERNS
+# ==============================================================================
+
+    # Add ecological classifications to species data
+        species_detailed <- species_diversity %>%
+            mutate(
+                # Assign dominance classes based on abundance rank
+                    dominance_class = case_when(
+                        abundance_rank == 1 ~ "Dominant",
+                        abundance_rank <= 3 ~ "Codominant", 
+                        abundance_rank <= 10 ~ "Common",
+                        abundance_rank <= 15 ~ "Occasional",
+                        TRUE ~ "Rare"
+                    ),
+                
+                # Categorize by proportional abundance
+                    abundance_category = case_when(
+                        prop_abundance >= 0.1 ~ "Very Abundant (≥10%)",
+                        prop_abundance >= 0.05 ~ "Abundant (5-10%)",
+                        prop_abundance >= 0.02 ~ "Moderate (2-5%)",
+                        prop_abundance >= 0.01 ~ "Low (1-2%)",
+                        TRUE ~ "Very Low (<1%)"
+                    ),
+                
+                # Calculate cumulative abundance for dominance curves
+                    cumulative_abundance = cumsum(prop_abundance),
+                
+                # Measure deviation from perfect evenness
+                    evenness_deviation = abs(prop_abundance - (1/S)),  
+                
+                # Extract genus for taxonomic grouping
+                    genus = str_extract(Species, "^\\w+")
+            ) %>%
+            arrange(desc(Presence_Points))
+    
+    # Display species-level analysis
+        cat("\nSpecies-level Diversity Analysis:\n")
+        print(species_detailed %>% 
+              dplyr::select(Species, Presence_Points, prop_abundance, abundance_rank, 
+                     dominance_class, cumulative_abundance))
+
+# ==============================================================================
+# STEP 5: CREATE DOMINANCE AND EVENNESS VISUALIZATIONS
+# ==============================================================================
+
+    # Plot 1: Species dominance curve (Lorenz-type curve)
+        p1 <- species_detailed %>%
+            mutate(species_rank_prop = abundance_rank / max(abundance_rank)) %>%
+            ggplot(aes(x = species_rank_prop, y = cumulative_abundance)) +
+                geom_line(size = 1.2, color = "steelblue") +
+                geom_point(aes(color = genus), size = 2, alpha = 0.7) +
+                geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+                           color = "red", alpha = 0.6) +
+                scale_color_viridis_d(name = "Genus") +
+                labs(
+                    title = "Species Dominance Curve",
+                    subtitle = "Deviation from red line indicates inequality",
+                    x = "Proportional Species Rank",
+                    y = "Cumulative Proportion of Total Abundance",
+                    caption = "Perfect evenness = diagonal red line"
+                ) +
+                theme_minimal()
+    
+    # Plot 2: Abundance profile by dominance class
+        p2 <- species_detailed %>%
+            ggplot(aes(x = abundance_rank, y = prop_abundance)) +
+                geom_col(aes(fill = dominance_class), alpha = 0.8, width = 0.7) +
+                geom_hline(yintercept = 1/S,                                      
+                          linetype = "dashed", color = "red") +
+                scale_fill_brewer(type = "qual", palette = "Set2", name = "Dominance\nClass") +
+                labs(
+                    title = "Species Abundance Profile",
+                    subtitle = "Red line = perfect evenness threshold",
+                    x = "Species Rank (by abundance)",
+                    y = "Proportional Abundance",
+                    caption = paste0("Perfect evenness = ", round(1/S, 3))      
+                ) +
+                theme_minimal()
+    
+    # Plot 3: Hill numbers comparison
+        hill_data <- data.frame(
+            q_value = c(0, 1, 2),
+            diversity_order = c("Species Richness (q=0)", 
+                               "Shannon Effective (q=1)", 
+                               "Simpson Effective (q=2)"),
+            effective_species = c(community_metrics$hill_q0,
+                                 community_metrics$hill_q1,
+                                 community_metrics$hill_q2)
+        )
+        
+        p3 <- hill_data %>%
+            ggplot(aes(x = factor(q_value), y = effective_species)) +
+                geom_col(fill = "coral", alpha = 0.7, width = 0.6) +
+                geom_text(aes(label = round(effective_species, 1)), 
+                         vjust = -0.5, size = 4, fontface = "bold") +
+                labs(
+                    title = "Hill Numbers (Effective Species Diversity)",
+                    subtitle = "Different sensitivity to rare vs. common species",
+                    x = "Diversity Order (q)",
+                    y = "Effective Number of Species",
+                    caption = "q=0: richness, q=1: typical diversity, q=2: dominance"
+                ) +
+                theme_minimal()
+
+# ==============================================================================
+# STEP 6: DISPLAY RESULTS AND CREATE SUMMARY TABLE
+# ==============================================================================
+
+    # Display all diversity plots
+        print(p1)
+        print(p2) 
+        print(p3)
+    
+    # Create comprehensive diversity summary table with corrected terminology
+        diversity_summary <- data.frame(
+            Metric = c("Species Richness", "Shannon Diversity (H')", 
+                       "Pielou Evenness (J')", "Simpson Dominance (λ)",        # CORRECTED: Proper nomenclature
+                       "Gini-Simpson (1-λ)", "Simpson Evenness",               # CORRECTED: Clarified naming
+                       "Berger-Parker Dominance", "Hill q=1", "Hill q=2"),
+            Value = c(community_metrics$species_richness,
+                      round(community_metrics$shannon_diversity, 3),
+                      round(community_metrics$shannon_evenness, 3),
+                      round(community_metrics$simpson_dominance, 3),
+                      round(community_metrics$gini_simpson, 3),                 # CORRECTED: Use Gini-Simpson
+                      round(community_metrics$simpson_evenness, 3),
+                      round(community_metrics$berger_parker, 3),
+                      round(community_metrics$hill_q1, 1),
+                      round(community_metrics$hill_q2, 1)),
+            Interpretation = c("Total number of species",
+                              "Higher = more diverse",
+                              "0-1 scale, 1 = perfectly even",
+                              "0-1 scale, higher = more dominated (original Simpson)",
+                              "0-1 scale, higher = more diverse",               # CORRECTED: Proper interpretation
+                              "Effective species / total species", 
+                              "Proportion of most abundant species",
+                              "Effective species (Shannon-based)",
+                              "Effective species (Simpson-based)")
+        )
+        
+        cat("\nTick Community Diversity Summary:\n")
+        cat("CORRECTED VERSION - Fixed variable consistency and Simpson nomenclature\n")
+        print(diversity_summary)
+
+# ==============================================================================
+# STEP 7: VALIDATION AND QUALITY CHECKS
+# ==============================================================================
+
+    # Add validation checks for corrected calculations
+        cat("\n=== VALIDATION CHECKS ===\n")
+        cat("1. Species count consistency:", S, "species\n")
+        cat("2. Proportional abundances sum to:", round(sum(species_diversity$prop_abundance), 6), "(should = 1.0)\n")
+        cat("3. Simpson components sum to:", round(sum(species_diversity$simpson_component), 6), "\n")
+        cat("4. Hill q0 equals species richness:", community_metrics$hill_q0 == S, "\n")
+        cat("5. Hill q1 range check (should be ≤ S):", community_metrics$hill_q1 <= S, "\n")
+        cat("6. Hill q2 range check (should be ≤ S):", community_metrics$hill_q2 <= S, "\n")
+
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 6. IMPORTING RASTER DATA | MAY REQUIRE LOCAL STORAGE SPACE...
+-----------------------------------------------------------------------------
+```{r IMPORTING RASTER DATA}
+
+  # Define local storage location for raster datasets
+      local_folder <- "Georgia_Tick_Rasters"
+      dir.create(local_folder, recursive = TRUE, showWarnings = FALSE)
+  
+  # Define source repository information
+      base_url <- "https://raw.githubusercontent.com/IanPsheaSmith/GeorgiaTickDist/main/CovariateRasters/"
+  
+  # Define list of environmental rasters to acquire
+      raster_files <- c(
+          # Bioclimatic variables
+            "Annual_Mean_Temperature.tif", 
+            "Annual_Precipitation.tif",
+            "Isothermality.tif",
+            "Max_Temperature_Warmest_Month.tif", 
+            "Mean_Diurnal_Range.tif",
+            "Mean_Temperature_Coldest_Quarter.tif", 
+            "Mean_Temperature_Driest_Quarter.tif",
+            "Mean_Temperature_Warmest_Quarter.tif", 
+            "Mean_Temperature_Wettest_Quarter.tif",
+            "Min_Temperature_Coldest_Month.tif",
+            "Precipitation_Coldest_Quarter.tif", 
+            "Precipitation_Driest_Month.tif",
+            "Precipitation_Driest_Quarter.tif", 
+            "Precipitation_Seasonality.tif",
+            "Precipitation_Warmest_Quarter.tif", 
+            "Precipitation_Wettest_Month.tif",
+            "Precipitation_Wettest_Quarter.tif",
+            "Temperature_Annual_Range.tif",
+            "Temperature_Seasonality.tif",
+          
+          # Soil properties
+            "BulkDensity.tif",
+            "CoarseFragments.tif",
+            "Nitrogen.tif",
+            "SandContent.tif", 
+            "SiltContent.tif",
+            "SoilOrganicCarbon.tif", 
+            "SoilpH.tif",
+          
+          # Topographic variables
+            "Elevation.tif", 
+            "Slope.tif",
+          
+          # Vegetation indices
+            "NDVI_mean.tif", 
+            "EVI_mean.tif",
+          
+          # Landscape metrics
+            "landscape_diversity_shdi.tif", 
+            "landcover_class.tif"
+      )
+  
+  # Download raster files from repository
+      cat("Downloading environmental raster files...\n")
+      
+      raster_files %>%
+          walk(function(file) {
+              cat("Downloading:", file, "... ")
+              download.file(
+                  url = paste0(base_url, file),
+                  destfile = file.path(local_folder, file),
+                  mode = "wb"  # Binary mode for raster files
+              )
+              cat("Done\n")
+          })
+  
+  # Load downloaded files into a multi-layer raster stack
+      CovStack <- stack(list.files(local_folder, pattern = "\\.tif$", full.names = TRUE))
+      
+      cat("Loaded raster stack with", nlayers(CovStack), "environmental layers\n")
+      
+      # Display basic information about the covariate stack
+      cat("\nEnvironmental covariate information:\n")
+      cat("Dimensions:", nrow(CovStack), "rows,", ncol(CovStack), "cols,", ncell(CovStack), "cells\n")
+      cat("Resolution:", res(CovStack)[1], "x", res(CovStack)[2], "degrees\n")
+      cat("Extent:", extent(CovStack)[1], "to", extent(CovStack)[2], "E,", 
+          extent(CovStack)[3], "to", extent(CovStack)[4], "N\n")
+      cat("Coordinate system:", crs(CovStack, asText = TRUE), "\n")
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 7. EXTRACTING RASTER DATA TO PRES POINTS FOR TRUE PRESENCE/ABSENCE DATA
+-----------------------------------------------------------------------------
+```{r EXTRACTING RASTER DATA}
+
+  # Define function to calculate landscape diversity (Shannon's Diversity Index)
+      calculate_shdi <- function(values) {
+          # Remove NA values
+            values <- values[!is.na(values)]
+          
+          # If no valid values, return NA
+            if (length(values) == 0) {
+                return(NA_real_)
+            }
+          
+          # Count occurrences of each unique value
+            value_counts <- table(values)
+          
+          # Calculate proportions
+            proportions <- value_counts / sum(value_counts)
+            
+          # Calculate Shannon's Diversity Index
+            shdi <- -sum(proportions * log(proportions))
+          
+          return(shdi)
+      }
+  
+  # Create standardized species code system for dataset naming
+      create_species_abbreviation <- function(species) {
+          parts <- strsplit(species, "_")[[1]]
+          genus_abbr <- substr(parts[1], 1, 2)
+          species_abbr <- substr(parts[2], 1, 3)
+          paste0(genus_abbr, species_abbr)
+      }
+      
+      # Generate abbreviation mapping
+        all_species <- names(spatial_species_PA_datasets)
+        species_abbr <- map_chr(all_species, create_species_abbreviation)
+        name_mapping <- setNames(species_abbr, all_species)
+  
+  # Ensure environmental data is in appropriate format
+      if (inherits(CovStack, "SpatRaster")) {
+          cov_raster <- stack(CovStack)
+      } else {
+          cov_raster <- CovStack
+      }
+      
+      # Extract landcover layer for landscape diversity calculations
+        landcover_raster <- cov_raster$landcover_class
+  
+  # Extract spatial point geometries
+      first_species <- spatial_species_PA_datasets[[1]]
+      all_point_geometries <- first_species
+      n_points <- nrow(all_point_geometries)
+  
+  # Define batch processing strategy for memory efficiency
+      batch_size <- 20
+      batch_indices <- split(1:n_points, ceiling(1:n_points / batch_size))
+  
+  # Extract environmental covariates for all points
+      all_covariates <- batch_indices %>%
+          imap_dfr(function(indices, batch_num) {
+              # Process each point in the batch
+                batch_results <- indices %>%
+                    map_dfr(function(i) {
+                      # Get the point
+                        point <- all_point_geometries[i,]
+                      
+                      # Extract covariates at point location
+                        covariates <- raster::extract(cov_raster, point)
+                      
+                      # Create buffer for landscape diversity calculation
+                        point_utm <- st_transform(point, crs = 32638)
+                        buffer_utm <- st_buffer(point_utm, dist = 1000)
+                        buffer_wgs84 <- st_transform(buffer_utm, crs = st_crs(landcover_raster))
+                      
+                      # Extract landcover values within buffer
+                        landcover_values <- raster::extract(landcover_raster, buffer_wgs84)
+                        landcover_values <- unlist(landcover_values)
+                      
+                      # Calculate landscape diversity
+                        shdi <- calculate_shdi(landcover_values)
+                      
+                      # Create result data frame for this point
+                        point_result <- as.data.frame(covariates)
+                        point_result$landscape_diversity_shdi <- shdi
+                        point_result$point_id <- i
+                      
+                      return(point_result)
+                  })
+              
+              # Release memory
+                gc(verbose = FALSE)
+              
+              return(batch_results)
+          })
+  
+  # Format and augment covariate data
+      # Convert landcover to factor variable
+        if ("landcover_class" %in% names(all_covariates)) {
+            all_covariates$landcover_class <- as.factor(all_covariates$landcover_class)
+        }
+      
+      # Add geographic coordinates
+        coords <- st_coordinates(all_point_geometries)
+        all_covariates$Longitude <- coords[, "X"]
+        all_covariates$Latitude <- coords[, "Y"]
+  
+  # Data quality assessment
+      na_counts <- colSums(is.na(all_covariates))
+      cols_with_na <- names(which(na_counts > 0))
+      
+  # Create species-specific BRT datasets
+      # Function to process individual species
+        process_species_presence <- function(species_name) {
+          # Get species-specific presence/absence data
+            species_data <- spatial_species_PA_datasets[[species_name]]
+          
+          # Add point ID for joining
+            species_data$point_id <- 1:nrow(species_data)
+          
+          # Extract presence column
+            presence_data <- data.frame(
+                point_id = species_data$point_id,
+                Presence = species_data$Presence
+            )
+          
+          # Join with covariates
+            species_dataset <- left_join(all_covariates, presence_data, by = "point_id")
+          
+          # Drop point_id column
+            species_dataset <- dplyr::select(species_dataset, -point_id)
+          
+          # Calculate presence statistics
+            presence_count <- sum(species_dataset$Presence)
+            presence_pct <- round(100 * presence_count / nrow(species_dataset), 1)
+          
+          # Create object in global environment
+            object_name <- paste0(name_mapping[species_name], "_BRTData")
+            assign(object_name, species_dataset, envir = .GlobalEnv)
+          
+          # Return dataset and metadata
+            list(
+                dataset = species_dataset,
+                name = species_name,
+                object_name = object_name,
+                presence_count = presence_count,
+                presence_pct = presence_pct
+            )
+      }
+      
+      # Process all species
+        species_BRT_datasets <- map(all_species, process_species_presence)
+        names(species_BRT_datasets) <- all_species
+        
+      # Extract datasets from list structure
+        species_BRT_datasets_simple <- map(species_BRT_datasets, ~ .$dataset)
+        names(species_BRT_datasets_simple) <- all_species
+  
+  # Generate summary statistics
+      summary_df <- map_dfr(species_BRT_datasets, function(result) {
+          tibble(
+              Species = gsub("_", " ", result$name),
+              Dataset = result$object_name,
+              Rows = nrow(result$dataset),
+              Columns = ncol(result$dataset),
+              Presence = result$presence_count,
+              Presence_Pct = paste0(result$presence_pct, "%"),
+              SHDI_Mean = round(mean(result$dataset$landscape_diversity_shdi, na.rm = TRUE), 3)
+          )
+      })
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 8. PSEUDO-ABSENCE POINT GENERATION
+-----------------------------------------------------------------------------
+```{r Creating Pseudo-Absence Datasets}
+
+  # Define function to create standardized species codes
+      create_species_abbreviation <- function(species) {
+          parts <- strsplit(species, "_")[[1]]
+          genus_abbr <- substr(parts[1], 1, 2)
+          species_abbr <- substr(parts[2], 1, 3)
+          paste0(genus_abbr, species_abbr)
+      }
+  
+  # Identify species with sufficient presence records for modeling
+      species_with_sufficient_presence <- c(
+          "Dermacentor_marginatus", 
+          "Dermacentor_reticulatus",
+          "Haemaphysalis_inermis",
+          "Haemaphysalis_parva",
+          "Haemaphysalis_punctata",
+          "Haemaphysalis_sulcata",
+          "Hyalomma_marginatum",
+          "Ixodes_ricinus",
+          "Rhipicephalus_annulatus",
+          "Rhipicephalus_bursa",
+          "Rhipicephalus_rossicus",
+          "Rhipicephalus_turanicus"
+      )
+      
+      # Create abbreviation mapping for dataset naming
+        species_abbr <- map_chr(species_with_sufficient_presence, create_species_abbreviation)
+        name_mapping <- setNames(species_abbr, species_with_sufficient_presence)
+  
+  # Define utility functions for spatial operations
+      # Convert coordinate data to spatial features
+        create_sf_points <- function(coords, crs = 4326) {
+            sf::st_as_sf(coords, coords = c("Longitude", "Latitude"), crs = crs)
+        }
+      
+      # Generate spatially-stratified pseudo-absence points
+        generate_pseudo_absences <- function(species_dataset, min_dist = 25000, crs = 4326, seed_val = 123) {
+          # Set seed for reproducibility
+            set.seed(seed_val)
+          
+          # Extract presence points with coordinates
+            presence_points <- species_dataset %>%
+                filter(Presence == 1) %>%
+                dplyr::select(Longitude, Latitude)
+            
+            n_presence <- nrow(presence_points)
+            
+          # Create sf object from presence points
+            presence_sf <- create_sf_points(presence_points)
+          
+          # Create a buffer around presence points (25km)
+            presence_buffer <- st_buffer(
+                st_transform(presence_sf, crs = 32638), 
+                dist = min_dist
+            ) %>%
+                st_transform(crs = crs)
+            
+          # Union all buffers
+            exclusion_zone <- st_union(presence_buffer)
+          
+          # Get area within Georgia excluding the buffer zones
+            valid_area <- st_difference(Georgia_Boundary, exclusion_zone)
+          
+          # Generate random points within the valid area
+            pseudo_absences_sf <- st_sample(valid_area, size = n_presence) %>%
+                st_sf() %>%
+                mutate(Presence = 0)
+            
+          # Convert to data frame with coordinates
+            pseudo_absences <- cbind(
+                st_coordinates(pseudo_absences_sf) %>% 
+                    as.data.frame() %>%
+                    rename(Longitude = X, Latitude = Y),
+                Presence = 0
+            )
+          
+          return(pseudo_absences)
+      }
+  
+  # Generate multiple replicate sets of pseudo-absence points
+      n_replicates <- 10
+      seed_values <- 1001:(1000 + n_replicates)
+      
+      # Create nested structure: species -> replicate -> points
+        pseudo_absence_sets <- map(species_with_sufficient_presence, function(species) {
+          # Retrieve the original species dataset
+            dataset_abbr <- name_mapping[species]
+            dataset_name <- paste0(dataset_abbr, "_BRTData")
+            original_dataset <- get(dataset_name)
+          
+          # Extract presence points
+            presence_points <- original_dataset %>%
+                filter(Presence == 1) %>%
+                dplyr::select(Longitude, Latitude, Presence)
+            
+          # Create replicate sets of pseudo-absence points
+            replicate_sets <- map(1:n_replicates, function(rep_num) {
+              # Generate pseudo-absence points with specific seed
+                pseudo_absences <- generate_pseudo_absences(
+                    original_dataset, 
+                    seed_val = seed_values[rep_num]
+                )
+              
+              # Return point sets and metadata
+                list(
+                    presence = presence_points,
+                    pseudo_absence = pseudo_absences,
+                    combined = bind_rows(presence_points, pseudo_absences),
+                    replicate = rep_num,
+                    seed = seed_values[rep_num]
+                )
+          })
+          
+          # Name the replicates
+            names(replicate_sets) <- paste0("replicate_", 1:n_replicates)
+          
+          return(replicate_sets)
+      })
+      
+      # Name the list elements
+        names(pseudo_absence_sets) <- species_with_sufficient_presence
+  
+  # Visualize presence and pseudo-absence distribution
+      species_maps <- map(species_with_sufficient_presence, function(species) {
+          # Get points from first replicate
+            points <- pseudo_absence_sets[[species]]$replicate_1
+          
+          # Create sf objects
+            points_sf <- create_sf_points(points$combined)
+          
+          # Format species name for display
+            display_name <- gsub("_", " ", species)
+          
+          # Create visualization
+            ggplot() +
+                geom_sf(data = Georgia_Boundary, fill = NA, color = "black") +
+                geom_sf(data = points_sf, aes(color = factor(Presence)), size = 1.5, alpha = 0.7) +
+                scale_color_manual(
+                    values = c("0" = "purple", "1" = "forestgreen"),
+                    labels = c("0" = "Pseudo-absence", "1" = "Presence"),
+                    name = "Point Type"
+                ) +
+                labs(
+                    title = paste0(display_name, " Presence/Pseudo-absence Points"),
+                    subtitle = paste0(
+                        nrow(points$presence), " presence points, ", 
+                        nrow(points$pseudo_absence), " pseudo-absence points (25km buffer)"
+                    ),
+                    x = "Longitude",
+                    y = "Latitude"
+                ) +
+                theme_minimal() +
+                theme(
+                    plot.title = element_text(face = "bold"),
+                    legend.position = "bottom"
+                ) +
+                coord_sf()
+      })
+  
+  # Evaluate spatial independence between replicate sets
+      compare_replicates <- function(species_name) {
+          replicates <- pseudo_absence_sets[[species_name]]
+          
+          # Calculate distances between points in different replicates
+            distances <- map(1:(n_replicates-1), function(i) {
+              rep_i <- replicates[[i]]$pseudo_absence
+              rep_i_sf <- create_sf_points(rep_i)
+              
+              map((i+1):n_replicates, function(j) {
+                  rep_j <- replicates[[j]]$pseudo_absence
+                  rep_j_sf <- create_sf_points(rep_j)
+                  
+                  # Calculate minimum distances between points
+                    min_dists <- st_nearest_feature(rep_i_sf, rep_j_sf)
+                    dist_values <- st_distance(rep_i_sf, rep_j_sf[min_dists,], by_element = TRUE)
+                  
+                  # Return summary statistics
+                    data.frame(
+                        replicate_i = i,
+                        replicate_j = j,
+                        min_dist_m = as.numeric(min(dist_values)),
+                        mean_dist_m = as.numeric(mean(dist_values)),
+                        max_dist_m = as.numeric(max(dist_values))
+                    )
+              }) %>% bind_rows()
+          }) %>% bind_rows()
+          
+          return(distances)
+      }
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 9. COVARIATE EXTRACTION FOR PRESENCE/PSEUDO-ABSENCE DATASETS
+-----------------------------------------------------------------------------
+```{r COVARIATE EXTRACTION FOR PRESENCE/PSEUDO-ABSENCE}
+
+  # Define function to extract environmental covariates for point data
+      extract_covariates <- function(points_df, cov_stack) {
+          # Convert to spatial features for extraction
+            points_sf <- st_as_sf(
+                points_df, 
+                coords = c("Longitude", "Latitude"), 
+                crs = st_crs(cov_stack)
+            )
+          
+          # Extract covariates from raster stack
+            cov_values <- raster::extract(cov_stack, points_sf)
+          
+          # Combine with original data
+            result <- cbind(points_df, as.data.frame(cov_values))
+          
+          # Convert landcover_class to factor if present
+            if ("landcover_class" %in% names(result)) {
+                result$landcover_class <- as.factor(result$landcover_class)
+            }
+          
+          return(result)
+      }
+  
+  # Ensure environmental data is in appropriate format
+      if (inherits(CovStack, "SpatRaster")) {
+          cov_stack <- stack(CovStack)
+      } else {
+          cov_stack <- CovStack
+      }
+  
+  # Generate processing queue for all species/replicate combinations
+      species_replicate_combos <- cross_df(list(
+          species_idx = 1:length(species_with_sufficient_presence),
+          rep_num = 1:n_replicates
+      ))
+  
+  # Process all combinations to create finalized modeling datasets
+      all_results <- map(1:nrow(species_replicate_combos), function(i) {
+          # Get species and replicate metadata
+            combo <- species_replicate_combos[i, ]
+            species_idx <- combo$species_idx
+            rep_num <- combo$rep_num
+            species_name <- species_with_sufficient_presence[species_idx]
+            abbr <- name_mapping[species_name]
+          
+          # Retrieve presence data with environmental covariates
+            dataset_name <- paste0(abbr, "_BRTData")
+            original_dataset <- get(dataset_name)
+            presence_data <- original_dataset %>% filter(Presence == 1)
+          
+          # Get pseudo-absence coordinates for this replicate
+            replicate_name <- paste0("replicate_", rep_num)
+            pseudo_absence_points <- pseudo_absence_sets[[species_name]][[replicate_name]]$pseudo_absence
+          
+          # Extract environmental covariates for pseudo-absence points
+            pseudo_absence_data <- extract_covariates(pseudo_absence_points, cov_stack)
+          
+          # Merge presence and pseudo-absence data
+            complete_dataset <- bind_rows(presence_data, pseudo_absence_data)
+          
+          # Create standardized dataset name
+            replicate_dataset_name <- paste0(abbr, "_PseudoAbs_", rep_num)
+          
+          # Store dataset in global environment
+            assign(replicate_dataset_name, complete_dataset, envir = .GlobalEnv)
+          
+          # Release memory
+            gc(verbose = FALSE)
+          
+          # Return dataset metadata
+            list(
+                dataset = complete_dataset,
+                dataset_name = replicate_dataset_name,
+                species_name = species_name,
+                replicate = rep_num,
+                n_presence = nrow(presence_data),
+                n_pseudo = nrow(pseudo_absence_data)
+            )
+      })
+  
+  # Generate summary statistics for created datasets
+      pseudo_datasets_summary <- map_dfr(all_results, function(result) {
+          tibble(
+              Species = gsub("_", " ", result$species_name),
+              Replicate = result$replicate,
+              Dataset_Name = result$dataset_name,
+              Rows = nrow(result$dataset),
+              Columns = ncol(result$dataset),
+              Presence_Points = result$n_presence,
+              Pseudo_Absence_Points = result$n_pseudo,
+              Buffer_Distance_km = 25
+          )
+      })
+  
+  # Data cleaning: Remove extraneous variables
+      pseudo_abs_datasets <- ls(pattern = "_PseudoAbs_\\d+$", envir = .GlobalEnv)
+      
+      invisible(
+          map(pseudo_abs_datasets, function(dataset_name) {
+              # Get dataset
+                dataset <- get(dataset_name)
+              
+              # Remove X variable if present (artifact of spatial extraction)
+                if ("X" %in% names(dataset)) {
+                    dataset <- dataset %>% dplyr::select(-X)
+                    assign(dataset_name, dataset, envir = .GlobalEnv)
+                }
+              
+              return(NULL)
+          })
+      )
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 10. LOAD IN CREATED REAL-PRESENCE BRT DATASETS
+-----------------------------------------------------------------------------
+```{r LOAD IN CREATED REAL-PRESENCE BRT DATASETS}
+
+  # Base URL for raw GitHub content
+      base_url <- "https://raw.githubusercontent.com/IanPsheaSmith/GeorgiaTickDist/main/BRT_RealAbs_Datasets/"
+  
+  # Create directory for downloaded files
+    if (!dir.exists("BRT_Data")) dir.create("BRT_Data")
+  
+  # Download and import individual datasets
+  
+    # Ixodes ricinus
+      Ixric_BRTData <- read.csv(paste0(base_url, "Ixric_BRTData.csv"))[, -1]
+      Ixric_BRTData$landcover_class <- as.factor(Ixric_BRTData$landcover_class)
+    
+    # Dermacentor reticulatus
+      Deret_BRTData <- read.csv(paste0(base_url, "Deret_BRTData.csv"))[, -1]
+      Deret_BRTData$landcover_class <- as.factor(Deret_BRTData$landcover_class)
+    
+    # Dermacentor marginatus
+      Demar_BRTData <- read.csv(paste0(base_url, "Demar_BRTData.csv"))[, -1]
+      Demar_BRTData$landcover_class <- as.factor(Demar_BRTData$landcover_class)
+      
+    # Haemaphysalis parva
+      Hapar_BRTData <- read.csv(paste0(base_url, "Hapar_BRTData.csv"))[, -1]
+      Hapar_BRTData$landcover_class <- as.factor(Hapar_BRTData$landcover_class)
+      
+    # Haemaphysalis punctata
+      Hapun_BRTData <- read.csv(paste0(base_url, "Hapun_BRTData.csv"))[, -1]
+      Hapun_BRTData$landcover_class <- as.factor(Hapun_BRTData$landcover_class)
+      
+    # Haemaphysalis inermis
+      Haine_BRTData <- read.csv(paste0(base_url, "Haine_BRTData.csv"))[, -1]
+      Haine_BRTData$landcover_class <- as.factor(Haine_BRTData$landcover_class)
+      
+    # Rhipicephalus bursa
+      Rhbur_BRTData <- read.csv(paste0(base_url, "Rhbur_BRTData.csv"))[, -1]
+      Rhbur_BRTData$landcover_class <- as.factor(Rhbur_BRTData$landcover_class)
+      
+    # Rhipicephalus annulatus
+      Rhann_BRTData <- read.csv(paste0(base_url, "Rhann_BRTData.csv"))[, -1]
+      Rhann_BRTData$landcover_class <- as.factor(Rhann_BRTData$landcover_class)
+      
+    # Rhipicephalus rossicus
+      Rhros_BRTData <- read.csv(paste0(base_url, "Rhros_BRTData.csv"))[, -1]
+      Rhros_BRTData$landcover_class <- as.factor(Rhros_BRTData$landcover_class)
+      
+    # Rhipicephalus turanicus
+      Rhtur_BRTData <- read.csv(paste0(base_url, "Rhtur_BRTData.csv"))[, -1]
+      Rhtur_BRTData$landcover_class <- as.factor(Rhtur_BRTData$landcover_class)
+    
+    # Hyalomma marginatum
+      Hymar_BRTData <- read.csv(paste0(base_url, "Hymar_BRTData.csv"))[, -1]
+      Hymar_BRTData$landcover_class <- as.factor(Hymar_BRTData$landcover_class)
+      
+    # Haemaphysalis sulcata
+      Hasul_BRTData <- read.csv(paste0(base_url, "Hasul_BRTData.csv"))[, -1]
+      Hasul_BRTData$landcover_class <- as.factor(Hasul_BRTData$landcover_class)
+    
+    # Hyalomma aegyptium
+      Hyaeg_BRTData <- read.csv(paste0(base_url, "Hyaeg_BRTData.csv"))[, -1]
+      Hyaeg_BRTData$landcover_class <- as.factor(Hyaeg_BRTData$landcover_class)
+      
+    # Rhipicephalus sanguineus
+      Rhsan_BRTData <- read.csv(paste0(base_url, "Rhsan_BRTData.csv"))[, -1]
+      Rhsan_BRTData$landcover_class <- as.factor(Rhsan_BRTData$landcover_class)
+    
+    # Haemaphysalis concinna
+      Hacon_BRTData <- read.csv(paste0(base_url, "Hacon_BRTData.csv"))[, -1]
+      Hacon_BRTData$landcover_class <- as.factor(Hacon_BRTData$landcover_class)
+    
+    # Haemaphysalis caucasica
+      Hacau_BRTData <- read.csv(paste0(base_url, "Hacau_BRTData.csv"))[, -1]
+      Hacau_BRTData$landcover_class <- as.factor(Hacau_BRTData$landcover_class)
+      
+    # Haemaphysalis erinacei
+      Haeri_BRTData <- read.csv(paste0(base_url, "Haeri_BRTData.csv"))[, -1]
+      Haeri_BRTData$landcover_class <- as.factor(Haeri_BRTData$landcover_class)
+      
+    # Hyalomma impeltatum
+      Hyimp_BRTData <- read.csv(paste0(base_url, "Hyimp_BRTData.csv"))[, -1]
+      Hyimp_BRTData$landcover_class <- as.factor(Hyimp_BRTData$landcover_class)
+    
+    # Ixodes acuminatus
+      Ixacu_BRTData <- read.csv(paste0(base_url, "Ixacu_BRTData.csv"))[, -1]
+      Ixacu_BRTData$landcover_class <- as.factor(Ixacu_BRTData$landcover_class)
+    
+    # Rhipicephalus pusillus
+      Rhpus_BRTData <- read.csv(paste0(base_url, "Rhpus_BRTData.csv"))[, -1]
+      Rhpus_BRTData$landcover_class <- as.factor(Rhpus_BRTData$landcover_class)
+    
+    # Hyalomma scupense
+      Hyscu_BRTData <- read.csv(paste0(base_url, "Hyscu_BRTData.csv"))[, -1]
+      Hyscu_BRTData$landcover_class <- as.factor(Hyscu_BRTData$landcover_class)
+    
+  # Download summary file
+    BRTData_Summary <- read.csv(paste0(base_url, "BRTData_Summary.csv"))[, -1]
+
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 11. LOAD IN CREATED PSEUDO-ABSENCE BRT DATASETS
+-----------------------------------------------------------------------------
+```{r LOAD IN CREATED PSEUDO-ABSENCE BRT DATASETS}
+
+
+  # Base URL for raw GitHub content
+  pseudo_abs_base_url <- "https://raw.githubusercontent.com/IanPsheaSmith/GeorgiaTickDist/main/BRT_PseudoAbs_Datasets/"
+  
+  # Create directory for downloaded files
+  if (!dir.exists("PseudoAbs_BRT_Data")) dir.create("PseudoAbs_BRT_Data")
+  
+  # Load summary file first to get dataset names
+  PseudoAbs_Summary <- read.csv(paste0(pseudo_abs_base_url, "pseudoabsence_datasets_summary.csv"))
+  
+  # Function to load a pseudo-absence dataset
+  load_pseudo_abs_dataset <- function(dataset_name) {
+    # Construct file path
+    file_path <- paste0(pseudo_abs_base_url, dataset_name, ".csv")
+    
+    # Read data
+    dataset <- read.csv(file_path)
+    
+    # Convert landcover_class to factor
+    if ("landcover_class" %in% names(dataset)) {
+      dataset$landcover_class <- as.factor(dataset$landcover_class)
+    }
+    
+    # Return dataset
+    return(dataset)
+  }
+
+  # Define species with pseudo-absence datasets
+  pseudo_abs_species <- c(
+    "Demar", "Deret", "Haine", "Hapar", "Hapun", "Hasul", 
+    "Hymar", "Ixric", "Rhann", "Rhbur", "Rhros", "Rhtur"
+  )
+  
+  # Generate all dataset names
+  all_dataset_names <- map(pseudo_abs_species, function(sp) {
+    map_chr(1:10, function(i) paste0(sp, "_PseudoAbs_", i))
+  }) %>% unlist()
+  
+  # Load all datasets and assign to global environment
+  invisible(
+    map(all_dataset_names, function(dataset_name) {
+      dataset <- load_pseudo_abs_dataset(dataset_name)
+      assign(dataset_name, dataset, envir = .GlobalEnv)
+      dataset_name
+    })
+  )
+  
+  # Create list for each species containing all 10 replicates
+  species_lists <- map(pseudo_abs_species, function(sp) {
+    # Create list name
+    list_name <- paste0(sp, "_PseudoAbs_List")
+    
+    # Create list of datasets
+    dataset_list <- map(1:10, function(i) {
+      dataset_name <- paste0(sp, "_PseudoAbs_", i)
+      get(dataset_name)
+    })
+    
+    # Assign list to global environment
+    assign(list_name, dataset_list, envir = .GlobalEnv)
+    
+    # Return list name
+    list_name
+  })
+
+  # Print summary of loaded datasets
+  cat("Loaded", nrow(PseudoAbs_Summary), "pseudo-absence datasets\n")
+  cat("Created dataset lists for", length(pseudo_abs_species), "species\n")
+  
+  # Count total number of presence points across all replicates
+  species_summary <- PseudoAbs_Summary %>%
+    group_by(Species) %>%
+    summarize(
+      Replicates = n_distinct(Replicate),
+      Presence_Points = first(Presence_Points),
+      Pseudo_Absence_Points = first(Pseudo_Absence_Points),
+      Total_Points = first(Presence_Points) + first(Pseudo_Absence_Points)
+    )
+  
+  print(species_summary)
+
+  # Create a convenient function to access datasets by species name and replicate
+  get_pseudoabs_dataset <- function(species_abbr, replicate_num = 1) {
+    if (!species_abbr %in% pseudo_abs_species) {
+      stop("Species abbreviation not found. Available species: ", 
+           paste(pseudo_abs_species, collapse=", "))
+    }
+    if (!replicate_num %in% 1:10) {
+      stop("Replicate number must be between 1 and 10")
+    }
+    
+    dataset_name <- paste0(species_abbr, "_PseudoAbs_", replicate_num)
+    return(get(dataset_name))
+  }
+
+```
+  
+
+
+-----------------------------------------------------------------------------
+CHUNK 12. BRTs USING TRUE PRESENCE DATA
+-----------------------------------------------------------------------------
+```{r BRTs USING TRUE PRESENCE DATA}
+
+  # Configure parallel processing environment
+      cl <- makeCluster(10)
+      registerDoParallel(cl)
+  
+  # Define comprehensive function for species distribution modeling
+      run_species_brt <- function(species_code) {
+          # Load required libraries within each worker
+          library(dplyr)
+          library(gbm)
+          library(raster)
+          
+          # Interpret species code for display
+          genus_part <- substr(species_code, 1, 2)
+          species_part <- substr(species_code, 3, 5)
+          
+          # Determine full genus name
+          species_display <- paste(
+              case_when(
+                  genus_part == "De" ~ "Dermacentor",
+                  genus_part == "Hy" ~ "Hyalomma", 
+                  genus_part == "Ix" ~ "Ixodes",
+                  genus_part == "Ha" ~ "Haemaphysalis",
+                  genus_part == "Rh" ~ "Rhipicephalus",
+                  TRUE ~ genus_part
+              ),
+              species_part
+          )
+          
+          # Retrieve and prepare modeling dataset
+          dataset_name <- paste0(species_code, "_BRTData")
+          
+          if (!exists(dataset_name)) {
+              stop(paste("Dataset", dataset_name, "not found in global environment"))
+          }
+          
+          raw_data <- get(dataset_name)
+          
+          # Format categorical variables and ensure proper data types
+          formatted_data <- raw_data %>%
+              mutate(
+                  landcover_class = as.factor(landcover_class),
+                  Presence = as.numeric(Presence)
+              )
+          
+          # Remove spatial coordinates from analysis
+          cols_to_keep <- !names(formatted_data) %in% c("Longitude", "Latitude")
+          formatted_data <- formatted_data[, cols_to_keep]
+          
+          # Handle missing values
+          clean_data <- na.omit(formatted_data)
+          
+          # Verify sufficient presence records for modeling
+          n_presences <- sum(clean_data$Presence)
+          if (n_presences <= 15) {
+              return(list(
+                  species_code = species_code,
+                  species_display = species_display,
+                  skipped = TRUE,
+                  reason = paste("Insufficient presences:", n_presences, "(<= 15)")
+              ))
+          }
+          
+          # Partition data for model training and evaluation
+          set.seed(1999)
+          train_indices <- sample(seq_len(nrow(clean_data)), 
+                                 size = floor(0.75 * nrow(clean_data)))
+          
+          train_data <- clean_data[train_indices, ]
+          test_data <- clean_data[-train_indices, ]
+          
+          # Apply differential weighting to balance classes
+          train_weights <- ifelse(train_data$Presence == 1, 1, 0.5)
+          
+          # Define model fitting function
+          fit_brt_model <- function(data, weights, predictors = NULL) {
+              if (is.null(predictors)) {
+                  # Use all variables except Presence
+                  formula_str <- "Presence ~ ."
+                  model_data <- data
+              } else {
+                  # Use only specified predictors
+                  model_data <- data[, c("Presence", predictors)]
+                  formula_str <- "Presence ~ ."
+              }
+              
+              brt_model <- gbm(
+                  as.formula(formula_str),
+                  data = model_data,
+                  distribution = "bernoulli",
+                  n.trees = 2500,
+                  interaction.depth = 5,
+                  shrinkage = 0.005,
+                  bag.fraction = 0.5,
+                  cv.folds = 10,
+                  weights = weights,
+                  n.minobsinnode = 10,
+                  verbose = FALSE
+              )
+              
+              return(brt_model)
+          }
+          
+          # Fit initial model
+          initial_model <- fit_brt_model(train_data, train_weights)
+          best_iter <- gbm.perf(initial_model, method = "cv", plot.it = FALSE)
+          
+          # Variable importance optimization
+          current_model <- initial_model
+          current_predictors <- names(train_data)[names(train_data) != "Presence"]
+          iteration <- 0
+          initial_cv_error <- min(current_model$cv.error)
+          
+          # Initialize tracking variables
+          removed_variables <- character(0)
+          importance_history <- data.frame(
+              iteration = 0, 
+              variables_count = length(current_predictors),
+              min_importance = NA, 
+              cv_error = initial_cv_error,
+              variables_removed = ""
+          )
+          
+          # Iterative variable selection process
+          repeat {
+              iteration <- iteration + 1
+              
+              # Assess variable importance
+              rel_inf <- summary(current_model, plot = FALSE)
+              min_importance <- min(rel_inf$rel.inf)
+              
+              # Identify variables with < 1% importance
+              low_importance_vars <- rel_inf[rel_inf$rel.inf < 1.0, "var"]
+              
+              # Termination criteria
+              if (length(low_importance_vars) == 0 ||
+                  length(current_predictors) <= 3 ||
+                  iteration > 30) {
+                  break
+              }
+              
+              # Remove least influential variable
+              var_to_remove <- low_importance_vars[which.min(
+                  rel_inf[rel_inf$var %in% low_importance_vars, "rel.inf"]
+              )]
+              
+              # Update predictors and rebuild model
+              current_predictors <- setdiff(current_predictors, var_to_remove)
+              temp_model <- fit_brt_model(train_data, train_weights, current_predictors)
+              
+              # Update tracking information
+              current_model <- temp_model
+              removed_variables <- c(removed_variables, var_to_remove)
+              
+              importance_history <- rbind(importance_history, 
+                                        data.frame(
+                                            iteration = iteration,
+                                            variables_count = length(current_predictors),
+                                            min_importance = min_importance,
+                                            cv_error = min(temp_model$cv.error),
+                                            variables_removed = var_to_remove
+                                        ))
+          }
+          
+          # Finalize optimized model
+          final_model <- current_model
+          final_optimal_trees <- gbm.perf(final_model, method = "cv", plot.it = FALSE)
+          final_importance <- summary(final_model, plot = FALSE)
+          
+          # Calculate model performance metrics
+          train_preds <- predict(final_model, train_data, n.trees = final_optimal_trees, 
+                                type = "response")
+          test_preds <- predict(final_model, test_data, n.trees = final_optimal_trees, 
+                               type = "response")
+          
+          train_rmse <- sqrt(mean((train_data$Presence - train_preds)^2))
+          test_rmse <- sqrt(mean((test_data$Presence - test_preds)^2))
+          
+          # Generate spatial predictions
+          predictions_raster <- predict(
+              CovStack,
+              final_model,
+              n.trees = final_optimal_trees,
+              type = "response"
+          )
+          
+          # Export key results to global environment
+          assign(paste0(species_code, "_final_model"), final_model, envir = .GlobalEnv)
+          assign(paste0(species_code, "_predictions"), predictions_raster, envir = .GlobalEnv)
+          assign(paste0(species_code, "_importance"), final_importance, envir = .GlobalEnv)
+          
+          # Return comprehensive results
+          list(
+              species_code = species_code,
+              species_display = species_display,
+              final_model = final_model,
+              optimal_trees = final_optimal_trees,
+              final_importance = final_importance,
+              removed_variables = removed_variables,
+              importance_history = importance_history,
+              performance = list(
+                  train_rmse = train_rmse,
+                  test_rmse = test_rmse,
+                  cv_error = min(final_model$cv.error)
+              ),
+              predictions_raster = predictions_raster,
+              training_data = train_data,
+              testing_data = test_data
+          )
+      }
+  
+  # Identify species for model development
+      original_species <- c(
+          "Ixodes_ricinus", "Dermacentor_reticulatus", "Dermacentor_marginatus",
+          "Haemaphysalis_parva", "Haemaphysalis_punctata", "Haemaphysalis_inermis", 
+          "Rhipicephalus_bursa", "Rhipicephalus_annulatus", "Rhipicephalus_rossicus", 
+          "Rhipicephalus_turanicus", "Hyalomma_marginatum", "Haemaphysalis_sulcata", 
+          "Hyalomma_aegyptium", "Rhipicephalus_sanguineus", "Haemaphysalis_concinna", 
+          "Haemaphysalis_caucasica", "Haemaphysalis_erinacei", "Hyalomma_impeltatum",
+          "Ixodes_acuminatus", "Rhipicephalus_pusillus", "Hyalomma_scupense"
+      )
+      
+      # Convert to standardized species codes
+      species_codes <- map_chr(original_species, function(sp) {
+          parts <- strsplit(sp, "_")[[1]]
+          genus <- substr(parts[1], 1, 2)
+          species <- substr(parts[2], 1, 3)
+          paste0(genus, species)
+      })
+  
+  # Execute modeling for all species using parallel processing
+      all_results <- species_codes %>%
+          map(~ {
+              tryCatch({
+                  run_species_brt(.x)
+              }, error = function(e) {
+                  return(NULL)
+              })
+          })
+      
+      # Name results for reference
+      names(all_results) <- species_codes
+      
+      # Categorize modeling outcomes
+      successful_results <- all_results[!map_lgl(all_results, is.null)]
+      skipped_results <- successful_results[map_lgl(successful_results, 
+                                            ~ !is.null(.x$skipped) && .x$skipped)]
+      successful_results <- successful_results[!map_lgl(successful_results, 
+                                              ~ !is.null(.x$skipped) && .x$skipped)]
+  
+  # Compile performance summary
+      summary_table <- successful_results %>%
+          map_dfr(~ {
+              data.frame(
+                  species_code = .x$species_code,
+                  species_display = .x$species_display,
+                  final_variables = nrow(.x$final_importance),
+                  variables_removed = length(.x$removed_variables),
+                  train_rmse = .x$performance$train_rmse,
+                  test_rmse = .x$performance$test_rmse,
+                  cv_error = .x$performance$cv_error,
+                  optimal_trees = .x$optimal_trees
+              )
+          })
+  
+  # Create visualizations of model performance
+      if (nrow(summary_table) > 0) {
+          # Performance comparison across species
+          performance_plot <- ggplot(summary_table, aes(x = species_code)) +
+              geom_col(aes(y = test_rmse), fill = "lightblue", alpha = 0.7) +
+              geom_point(aes(y = train_rmse), color = "red", size = 2) +
+              labs(
+                  title = "Model Performance Summary",
+                  subtitle = "Bars = Test RMSE, Points = Train RMSE",
+                  x = "Species Code",
+                  y = "RMSE"
+              ) +
+              theme_minimal() +
+              theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          
+          print(performance_plot)
+          
+          # Model complexity visualization
+          var_count_plot <- ggplot(summary_table, aes(x = species_code)) +
+              geom_col(aes(y = final_variables), fill = "orchid", alpha = 0.7) +
+              labs(
+                  title = "Final Variable Count by Species",
+                  x = "Species Code",
+                  y = "Number of Variables in Final Model"
+              ) +
+              theme_minimal() +
+              theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          
+          print(var_count_plot)
+      }
+  
+  # Release parallel processing resources
+      stopCluster(cl)
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 13. ENSEMBLE BRTs W/ PSEUDOABSENCES
+-----------------------------------------------------------------------------
+```{r ENSEMBLE BRTs W/ PSEUDOABSENCES}
+
+  # Configure parallel processing environment for computational efficiency
+      cl <- makeCluster(15)
+      registerDoParallel(cl)
+  
+  # Define comprehensive function for ensemble species distribution modeling
+      run_species_ensemble_brt <- function(species_code, n_replicates = 10) {
+          # Load required libraries within each worker
+            library(dplyr)
+            library(gbm)
+            library(raster)
+          
+          # Interpret species code for display
+            genus_part <- substr(species_code, 1, 2)
+            species_part <- substr(species_code, 3, 5)
+          
+          # Determine full genus name
+            species_display <- paste(
+                case_when(
+                    genus_part == "De" ~ "Dermacentor",
+                    genus_part == "Hy" ~ "Hyalomma", 
+                    genus_part == "Ix" ~ "Ixodes",
+                    genus_part == "Ha" ~ "Haemaphysalis",
+                    genus_part == "Rh" ~ "Rhipicephalus",
+                    TRUE ~ genus_part
+                ),
+                species_part
+            )
+          
+          # Verify dataset availability
+            replicate_datasets <- paste0(species_code, "_PseudoAbs_", 1:n_replicates)
+            existing_datasets <- replicate_datasets[sapply(replicate_datasets, exists)]
+          
+          if (length(existing_datasets) == 0) {
+              return(list(
+                  species_code = species_code,
+                  species_display = species_display,
+                  skipped = TRUE,
+                  reason = "No pseudo-absence datasets found"
+              ))
+          }
+          
+          # Define model fitting function
+            fit_brt_model <- function(data, weights, predictors = NULL) {
+                if (is.null(predictors)) {
+                    # Use all variables except Presence
+                      formula_str <- "Presence ~ ."
+                      model_data <- data
+                } else {
+                    # Use only specified predictors
+                      model_data <- data[, c("Presence", predictors)]
+                      formula_str <- "Presence ~ ."
+                }
+                
+                brt_model <- gbm(
+                    as.formula(formula_str),
+                    data = model_data,
+                    distribution = "bernoulli",
+                    n.trees = 2500,
+                    interaction.depth = 5,
+                    shrinkage = 0.005,
+                    bag.fraction = 0.5,
+                    cv.folds = 10,
+                    weights = weights,
+                    n.minobsinnode = 10,
+                    verbose = FALSE
+                )
+                
+                return(brt_model)
+          }
+          
+          # Process each replicate dataset
+            replicate_results <- list()
+            all_importance_vars <- character(0)
+            
+            for (i in seq_along(existing_datasets)) {
+                dataset_name <- existing_datasets[i]
+                replicate_num <- i
+              
+              # Load and preprocess dataset
+                raw_data <- get(dataset_name)
+                formatted_data <- raw_data %>%
+                    mutate(
+                        landcover_class = as.factor(landcover_class),
+                        Presence = as.numeric(Presence)
+                    )
+              
+              # Remove spatial coordinates
+                cols_to_keep <- !names(formatted_data) %in% c("Longitude", "Latitude")
+                formatted_data <- formatted_data[, cols_to_keep]
+              
+              # Handle missing values
+                clean_data <- na.omit(formatted_data)
+              
+              # Verify sufficient presence records
+                n_presences <- sum(clean_data$Presence)
+                if (n_presences <= 15) {
+                    next
+                }
+              
+              # Partition data for model training and evaluation
+                set.seed(1999 + replicate_num)
+                train_indices <- sample(seq_len(nrow(clean_data)), 
+                                      size = floor(0.75 * nrow(clean_data)))
+                
+                train_data <- clean_data[train_indices, ]
+                test_data <- clean_data[-train_indices, ]
+              
+              # Apply differential weighting to balance classes
+                train_weights <- ifelse(train_data$Presence == 1, 1, 0.5)
+              
+              # Fit initial model
+                initial_model <- fit_brt_model(train_data, train_weights)
+                best_iter <- gbm.perf(initial_model, method = "cv", plot.it = FALSE)
+              
+              # Variable importance optimization
+                current_model <- initial_model
+                current_predictors <- names(train_data)[names(train_data) != "Presence"]
+                iteration <- 0
+                initial_cv_error <- min(current_model$cv.error)
+                removed_variables <- character(0)
+                
+              # Iterative variable selection process
+                repeat {
+                    iteration <- iteration + 1
+                  
+                  # Assess variable importance
+                    rel_inf <- summary(current_model, plot = FALSE)
+                    low_importance_vars <- rel_inf[rel_inf$rel.inf < 1.0, "var"]
+                  
+                  # Termination criteria
+                    if (length(low_importance_vars) == 0 || 
+                        length(current_predictors) <= 3 || 
+                        iteration > 30) {
+                        break
+                    }
+                  
+                  # Remove least influential variable
+                    var_to_remove <- low_importance_vars[which.min(
+                        rel_inf[rel_inf$var %in% low_importance_vars, "rel.inf"]
+                    )]
+                    current_predictors <- setdiff(current_predictors, var_to_remove)
+                    current_model <- fit_brt_model(train_data, train_weights, current_predictors)
+                    removed_variables <- c(removed_variables, var_to_remove)
+              }
+              
+              # Evaluate final model
+                final_model <- current_model
+                final_optimal_trees <- gbm.perf(final_model, method = "cv", plot.it = FALSE)
+                final_importance <- summary(final_model, plot = FALSE)
+              
+              # Calculate performance metrics
+                train_preds <- predict(final_model, train_data, n.trees = final_optimal_trees, 
+                                      type = "response")
+                test_preds <- predict(final_model, test_data, n.trees = final_optimal_trees, 
+                                     type = "response")
+                
+                train_rmse <- sqrt(mean((train_data$Presence - train_preds)^2))
+                test_rmse <- sqrt(mean((test_data$Presence - test_preds)^2))
+              
+              # Generate spatial predictions
+                predictions_raster <- predict(
+                    CovStack,
+                    final_model,
+                    n.trees = final_optimal_trees,
+                    type = "response"
+                )
+              
+              # Store replicate results
+                replicate_results[[replicate_num]] <- list(
+                    replicate = replicate_num,
+                    dataset_name = dataset_name,
+                    final_model = final_model,
+                    optimal_trees = final_optimal_trees,
+                    final_importance = final_importance,
+                    removed_variables = removed_variables,
+                    performance = list(
+                        train_rmse = train_rmse,
+                        test_rmse = test_rmse,
+                        cv_error = min(final_model$cv.error)
+                    ),
+                    predictions_raster = predictions_raster,
+                    n_variables = nrow(final_importance),
+                    n_presences = n_presences
+                )
+              
+              # Track important variables for ensemble analysis
+                all_importance_vars <- unique(c(all_importance_vars, final_importance$var))
+          }
+          
+          # Filter successful replicates
+            successful_replicates <- replicate_results[!sapply(replicate_results, is.null)]
+            
+            if (length(successful_replicates) == 0) {
+                return(list(
+                    species_code = species_code,
+                    species_display = species_display,
+                    skipped = TRUE,
+                    reason = "No successful replicates"
+                ))
+          }
+          
+          # Generate ensemble predictions
+            prediction_rasters <- map(successful_replicates, ~ .x$predictions_raster)
+            ensemble_raster <- stack(prediction_rasters)
+            ensemble_mean <- calc(ensemble_raster, fun = mean, na.rm = TRUE)
+            ensemble_sd <- calc(ensemble_raster, fun = sd, na.rm = TRUE)
+          
+          # Calculate ensemble variable importance
+            all_importance <- map_dfr(successful_replicates, ~ {
+                .x$final_importance %>%
+                    mutate(replicate = .x$replicate)
+            })
+            
+            ensemble_importance <- all_importance %>%
+                group_by(var) %>%
+                summarise(
+                    rel.inf = mean(rel.inf, na.rm = TRUE),
+                    frequency = n(),
+                    .groups = "drop"
+                ) %>%
+                arrange(desc(rel.inf))
+          
+          # Compile performance metrics
+            performance_summary <- map_dfr(successful_replicates, ~ {
+                data.frame(
+                    replicate = .x$replicate,
+                    train_rmse = .x$performance$train_rmse,
+                    test_rmse = .x$performance$test_rmse,
+                    cv_error = .x$performance$cv_error,
+                    n_variables = .x$n_variables,
+                    n_presences = .x$n_presences
+                )
+            })
+            
+            ensemble_performance <- list(
+                mean_train_rmse = mean(performance_summary$train_rmse),
+                mean_test_rmse = mean(performance_summary$test_rmse),
+                mean_cv_error = mean(performance_summary$cv_error),
+                sd_train_rmse = sd(performance_summary$train_rmse),
+                sd_test_rmse = sd(performance_summary$test_rmse),
+                sd_cv_error = sd(performance_summary$cv_error)
+            )
+          
+          # Export key results to global environment
+            assign(paste0(species_code, "_ensemble_predictions"), 
+                   ensemble_mean, envir = .GlobalEnv)
+            assign(paste0(species_code, "_ensemble_uncertainty"), 
+                   ensemble_sd, envir = .GlobalEnv)
+            assign(paste0(species_code, "_ensemble_importance"), 
+                   ensemble_importance, envir = .GlobalEnv)
+            assign(paste0(species_code, "_replicate_results"), 
+                   successful_replicates, envir = .GlobalEnv)
+          
+          # Return comprehensive results
+            list(
+                species_code = species_code,
+                species_display = species_display,
+                n_successful_replicates = length(successful_replicates),
+                replicate_results = successful_replicates,
+                ensemble_predictions = ensemble_mean,
+                ensemble_uncertainty = ensemble_sd,
+                ensemble_importance = ensemble_importance,
+                performance_summary = performance_summary,
+                ensemble_performance = ensemble_performance,
+                all_importance_data = all_importance
+            )
+      }
+  
+  # Identify species for model development
+      pseudo_abs_datasets <- ls(pattern = "_PseudoAbs_\\d+$", envir = .GlobalEnv)
+      species_codes <- unique(gsub("_PseudoAbs_\\d+$", "", pseudo_abs_datasets))
+  
+  # Execute ensemble modeling for all species
+      ensemble_results <- species_codes %>%
+          map(~ {
+              tryCatch({
+                  run_species_ensemble_brt(.x, n_replicates = 10)
+              }, error = function(e) {
+                  return(NULL)
+              })
+          })
+      
+      # Name results for reference
+        names(ensemble_results) <- species_codes
+      
+      # Categorize modeling outcomes
+        successful_ensemble_results <- ensemble_results[!map_lgl(ensemble_results, is.null)]
+        skipped_ensemble_results <- successful_ensemble_results[
+            map_lgl(successful_ensemble_results, ~ !is.null(.x$skipped) && .x$skipped)]
+        successful_ensemble_results <- successful_ensemble_results[
+            !map_lgl(successful_ensemble_results, ~ !is.null(.x$skipped) && .x$skipped)]
+  
+  # Compile comprehensive performance summary
+      ensemble_summary_table <- successful_ensemble_results %>%
+          map_dfr(~ {
+              data.frame(
+                  species_code = .x$species_code,
+                  species_display = .x$species_display,
+                  successful_replicates = .x$n_successful_replicates,
+                  mean_test_rmse = .x$ensemble_performance$mean_test_rmse,
+                  sd_test_rmse = .x$ensemble_performance$sd_test_rmse,
+                  mean_cv_error = .x$ensemble_performance$mean_cv_error,
+                  sd_cv_error = .x$ensemble_performance$sd_cv_error,
+                  top_variable = .x$ensemble_importance$var[1],
+                  top_variable_importance = .x$ensemble_importance$rel.inf[1]
+              )
+          })
+  
+  # Create visualizations of model performance
+      if (nrow(ensemble_summary_table) > 0) {
+          # Performance comparison across species
+            performance_plot <- ggplot(ensemble_summary_table, aes(x = species_code)) +
+                geom_col(aes(y = mean_test_rmse), fill = "lightblue", alpha = 0.7) +
+                geom_errorbar(
+                    aes(ymin = mean_test_rmse - sd_test_rmse, 
+                        ymax = mean_test_rmse + sd_test_rmse), 
+                    width = 0.2, color = "red"
+                ) +
+                labs(
+                    title = "Ensemble Model Performance",
+                    subtitle = "Mean Test RMSE ± SD across replicates",
+                    x = "Species Code",
+                    y = "Test RMSE"
+                ) +
+                theme_minimal() +
+                theme(axis.text.x = element_text(angle = 45, hjust = 1))
+            
+            print(performance_plot)
+          
+          # Replicate success visualization
+            replicate_plot <- ggplot(ensemble_summary_table, aes(x = species_code)) +
+                geom_col(aes(y = successful_replicates), fill = "orchid", alpha = 0.7) +
+                geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+                labs(
+                    title = "Successful Replicates per Species",
+                    x = "Species Code",
+                    y = "Number of Successful Replicates"
+                ) +
+                theme_minimal() +
+                theme(axis.text.x = element_text(angle = 45, hjust = 1))
+            
+            print(replicate_plot)
+      }
+  
+  # Analyze variable importance patterns across species
+      if (length(successful_ensemble_results) > 0) {
+          all_variables_summary <- successful_ensemble_results %>%
+              map_dfr(~ {
+                  .x$ensemble_importance %>%
+                      mutate( species_code = .x$species_code,
+                          species_display = .x$species_display
+                      )
+              }) %>%
+              group_by(var) %>%
+              summarise(
+                  mean_importance = mean(rel.inf, na.rm = TRUE),
+                  sd_importance = sd(rel.inf, na.rm = TRUE),
+                  species_count = n(),
+                  max_importance = max(rel.inf, na.rm = TRUE),
+                  .groups = "drop"
+              ) %>%
+              arrange(desc(mean_importance))
+      }
+  
+  # Release parallel processing resources
+      stopCluster(cl)
+      
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 14. CLUSTGEO IMPLEMENTATION FOR TICK SPECIES BIOREGIONALIZATION
+-----------------------------------------------------------------------------
+```{r CLUSTGEO GEORGIA/TICKS BIOREGIONALIZATION}
+
+  # ==============================================================================
+  # STEP 1: DATA PREPARATION AND QUALITY CONTROL
+  # ==============================================================================
+
+    # Load and combine all species presence data
+        species_list <- c(
+            "Ixodes ricinus", "Dermacentor reticulatus", "Dermacentor marginatus",
+            "Haemaphysalis parva", "Haemaphysalis punctata", "Haemaphysalis inermis",
+            "Rhipicephalus bursa", "Rhipicephalus annulatus", "Rhipicephalus rossicus", 
+            "Rhipicephalus turanicus", "Hyalomma marginatum", "Haemaphysalis sulcata",
+            "Hyalomma aegyptium", "Rhipicephalus sanguineus", "Haemaphysalis concinna",
+            "Haemaphysalis caucasica", "Haemaphysalis erinacei", "Hyalomma impeltatum",
+            "Ixodes acuminatus", "Rhipicephalus pusillus", "Hyalomma scupense"
+        )
+  
+    # Combine all species presence data
+        species_data_list <- purrr::map(species_list, function(species) {
+            object_name <- paste0(gsub(" ", "_", species), "_presence")
+            if (exists(object_name, inherits = TRUE)) {
+                obj <- get(object_name, inherits = TRUE)
+                obj$species <- species
+                return(obj)
+            } else {
+                return(NULL)
+            }
+        }) %>% 
+            purrr::compact()
+  
+        if (length(species_data_list) == 0) {
+            stop("No species presence data found. Check object names.")
+        }
+  
+        combined_species_data <- dplyr::bind_rows(species_data_list)
+  
+        cat("Loaded data for", length(species_data_list), "species\n")
+        cat("Total presence records:", nrow(combined_species_data), "\n")
+
+  # ==============================================================================
+  # STEP 2: CREATE SITE-SPECIES MATRIX
+  # ==============================================================================
+
+    set.seed(1999)  # Reproducibility for kmeans and downstream steps
+
+    # Extract coordinates for clustering
+        coords <- sf::st_coordinates(combined_species_data)
+        coords_df <- data.frame(
+            x = coords[,1],
+            y = coords[,2],
+            species = combined_species_data$species,
+            record_id = 1:nrow(combined_species_data)
+        )
+  
+    # Set a range of possible site counts (clusters)
+        possible_sites <- seq(10, 100, by = 5)
+          # Fewer than 10 is not ecologically or probabilistically reasonable
+          # given the size of the study area and the number of presence locations
+  
+        site_diag <- purrr::map_dfr(possible_sites, function(k) {
+            km <- kmeans(coords_df[,1:2], centers = k, nstart = 50)
+            coords_df$site_id <- paste0("Site_", km$cluster)
+            # Create site-species incidence
+              mat <- combined_species_data %>%
+                  sf::st_drop_geometry() %>%
+                  dplyr::mutate(site_id = coords_df$site_id) %>%
+                  dplyr::group_by(site_id, species) %>%
+                  dplyr::summarise(presence = max(Presence), .groups = 'drop') %>%
+                  tidyr::pivot_wider(names_from = species, values_from = presence, values_fill = 0)
+              
+              # Fix tibble rownames warning - convert to data.frame first
+                mat <- as.data.frame(mat)
+                rownames(mat) <- mat$site_id
+                mat <- mat %>% dplyr::select(-site_id) %>% as.matrix()
+                n_sites <- nrow(mat)
+              
+            # Species richness and site sizes
+              site_richness <- rowSums(mat)
+              min_rich <- min(site_richness)
+              mean_rich <- mean(site_richness)
+              min_size <- min(table(coords_df$site_id))
+              mean_size <- mean(table(coords_df$site_id))
+            # WSS (geographic)
+              wss <- sum(km$withinss)
+              tibble::tibble(
+                  k = k,
+                  n_sites = n_sites,
+                  mean_richness = mean_rich,
+                  min_richness = min_rich,
+                  mean_size = mean_size,
+                  min_size = min_size,
+                  wss = wss
+              )
+        })
+  
+    # Plot diagnostics to choose best number of sites
+        p1_site <- ggplot(site_diag, aes(x = k, y = wss)) +
+            geom_line() + geom_point() + labs(y = "Geographic WSS", x = "Number of Sites (k)")
+        p2_site <- ggplot(site_diag, aes(x = k, y = mean_richness)) +
+            geom_line() + geom_point() + labs(y = "Mean Species Richness per Site", x = "Number of Sites (k)")
+        p3_site <- ggplot(site_diag, aes(x = k, y = min_size)) +
+            geom_line() + geom_point() +
+            labs(y = "Min Samples per Site", x = "Number of Sites (k)")
+  
+        print(p1_site | p2_site | p3_site)
+  
+    # ---- PICK A FINAL NUMBER OF SITES ----
+        final_k_sites <- 25  # Based on Plots p1-p3
+  
+    # ---- RUN FINAL SITE DEFINITION ----
+        km <- kmeans(coords_df[,1:2], centers = final_k_sites, nstart = 50)
+        coords_df$site_id <- paste0("Site_", km$cluster)
+        combined_species_data$site_id <- coords_df$site_id
+  
+    # ---- CREATE FINAL SITE-SPECIES MATRIX ----
+        site_species_matrix <- combined_species_data %>%
+            sf::st_drop_geometry() %>%
+            dplyr::group_by(site_id, species) %>%
+            dplyr::summarise(presence = max(Presence), .groups = 'drop') %>%
+            tidyr::pivot_wider(names_from = species, values_from = presence, values_fill = 0)
+        
+        # Fix tibble rownames warning - convert to data.frame first
+            site_names <- site_species_matrix$site_id
+            site_species_matrix <- as.data.frame(site_species_matrix)
+            site_species_matrix <- site_species_matrix %>%
+                dplyr::select(-site_id) %>%
+                as.matrix()
+            rownames(site_species_matrix) <- site_names
+  
+        cat("Site-species matrix dimensions:", dim(site_species_matrix), "\n")
+        cat("Species richness range:", range(rowSums(site_species_matrix)), "\n")
+
+  # ==============================================================================
+  # STEP 3: ENVIRONMENTAL DATA EXTRACTION
+  # ==============================================================================
+
+    # Calculate site centroids
+        site_centroids <- coords_df %>%
+            dplyr::group_by(site_id) %>%
+            dplyr::summarise(
+                centroid_x = mean(x),
+                centroid_y = mean(y),
+                n_records = dplyr::n(),
+                .groups = 'drop'
+            )
+ 
+    # Extract environmental data for sites
+        site_coords_sf <- sf::st_as_sf(
+            site_centroids, 
+            coords = c("centroid_x", "centroid_y"), 
+            crs = sf::st_crs(combined_species_data)
+        )
+        env_data <- raster::extract(
+          CovStack, 
+          site_coords_sf, 
+          buffer = 1000,      # 1000 meters
+          fun = mean,        # mean across all cells in buffer
+          na.rm = TRUE
+        )
+        rownames(env_data) <- site_centroids$site_id
+  
+    # Filter sites with complete environmental data
+        complete_sites <- complete.cases(env_data)
+        cat("Sites with complete environmental data:", sum(complete_sites), "of", nrow(env_data), "\n")
+  
+    # Subset matrices to complete sites only
+        site_species_final <- site_species_matrix[complete_sites, ]
+        env_data_final <- env_data[complete_sites, ]
+        site_centroids_final <- site_centroids[complete_sites, ]
+  
+        cat("Final dataset:", nrow(site_species_final), "sites ×", ncol(site_species_final), "species\n")
+
+  # ==============================================================================
+  # STEP 4: COMPUTE DISSIMILARITY MATRICES
+  # ==============================================================================
+
+    # D0: Ecological dissimilarity based on species composition (Jaccard)
+        D0 <- vegan::vegdist(site_species_final, method = "jaccard", binary = TRUE)
+        cat("D0 (ecological): Jaccard dissimilarity on species composition\n")
+        cat("  Range:", round(range(D0), 3), "\n")
+  
+    # D1: Geographical dissimilarity based on site centroids
+        coords_final <- site_centroids_final[, c("centroid_x", "centroid_y")]
+        D1_matrix <- geodist::geodist(coords_final, measure = "haversine") / 1000  # Convert to km
+        D1 <- as.dist(D1_matrix)
+        cat("D1 (geographical): Euclidean distance between site centroids\n")
+        cat("  Range:", round(range(D1), 1), "km\n")
+
+  # ==============================================================================
+  # STEP 5: DETERMINE OPTIMAL NUMBER OF CLUSTERS (K)
+  # ==============================================================================
+
+    # Build baseline ecological clustering tree
+        tree_eco <- ClustGeo::hclustgeo(D0)
+  
+    # Parameters for ensemble diagnostics
+        k_range <- 2:min(15, nrow(site_species_final) - 1)
+        min_cluster_size <- 3 # No fewer than 3 bioregions 
+        min_mean_richness <- 2 # No regions with less than 2 species (mean) per site
+  
+    # Calculate ensemble diagnostics
+        ensemble_diag <- purrr::map_dfr(k_range, function(k) {
+          clusters <- cutree(tree_eco, k = k)
+          cluster_assign <- split(1:length(clusters), clusters)
+          
+          # Within-cluster sum of squares
+            wss <- sum(sapply(cluster_assign, function(ix) {
+              if (length(ix) < 2) return(0)
+              dmat <- as.matrix(vegan::vegdist(site_species_final[ix, ], method = "jaccard", binary = TRUE))
+              sum(dmat^2) / (2 * length(ix))
+            }))
+          
+          # Mean between-cluster Jaccard dissimilarity
+            between_dissim <- NA
+            if (length(cluster_assign) > 1) {
+              cluster_means <- lapply(cluster_assign, function(ix) colMeans(site_species_final[ix, , drop = FALSE]))
+              combos <- combn(seq_along(cluster_means), 2, simplify = FALSE)
+              dissims <- sapply(combos, function(pair) {
+                vegan::vegdist(rbind(cluster_means[[pair[1]]], cluster_means[[pair[2]]]), method="jaccard")
+              })
+              between_dissim <- mean(dissims)
+            }
+          
+          # Cluster sizes and species richness
+            cluster_sizes <- sapply(cluster_assign, length)
+            mean_size <- mean(cluster_sizes)
+            min_size <- min(cluster_sizes)
+            richness <- sapply(cluster_assign, function(ix) mean(rowSums(site_species_final[ix, , drop = FALSE])))
+            mean_rich <- mean(richness)
+            min_rich <- min(richness)
+          
+          # Silhouette width
+            sil_score <- tryCatch({
+              mean(cluster::silhouette(clusters, vegan::vegdist(site_species_final, method = "jaccard", binary = TRUE))[, 3])
+            }, error = function(e) NA)
+          
+          # Calinski-Harabasz index
+            ch_score <- tryCatch({
+              fpc::cluster.stats(vegan::vegdist(site_species_final, method = "jaccard", binary = TRUE), clusters)$ch
+            }, error = function(e) NA)
+          
+            tibble::tibble(
+              k = k,
+              wss = wss,
+              between_jaccard = between_dissim,
+              mean_cluster_size = mean_size,
+              min_cluster_size = min_size,
+              mean_richness = mean_rich,
+              min_richness = min_rich,
+              silhouette = sil_score,
+              calinski_harabasz = ch_score
+            )
+          })
+  
+    # Plot diagnostics
+        p1 <- ggplot(ensemble_diag, aes(x = k, y = wss)) +
+          geom_line() + geom_point() + labs(y = "Within-cluster sum of squares (WSS)", x = "Number of Clusters (k)")
+        p2 <- ggplot(ensemble_diag, aes(x = k, y = between_jaccard)) +
+          geom_line() + geom_point() + labs(y = "Mean Between-Cluster Jaccard", x = "Number of Clusters (k)")
+        p3 <- ggplot(ensemble_diag, aes(x = k, y = min_cluster_size)) +
+          geom_line() + geom_point() +
+          geom_hline(yintercept = min_cluster_size, linetype="dashed", color="red") +
+          labs(y = "Minimum Cluster Size", x = "Number of Clusters (k)")
+        p4 <- ggplot(ensemble_diag, aes(x = k, y = mean_richness)) +
+          geom_line() + geom_point() +
+          geom_hline(yintercept = min_mean_richness, linetype="dashed", color="blue") +
+          labs(y = "Mean Species Richness per Cluster", x = "Number of Clusters (k)")
+  
+        print((p1 | p2) / (p3 | p4))
+  
+    # ---- Ensemble selection for plausible k ----
+        recommended_k <- ensemble_diag$k[
+          ensemble_diag$min_cluster_size >= min_cluster_size &
+            ensemble_diag$mean_richness >= min_mean_richness &
+            !is.na(ensemble_diag$between_jaccard)
+        ]
+        cat("\nPlausible cluster counts (k) w/o considering plots: ", paste(recommended_k, collapse=", "), "\n")
+  
+    # ---- Suggested k-value ----
+        optimal_k <- 3
+        cat("Suggested k for further analysis based on ensemble + plots:", optimal_k, "\n")
+
+  # ==============================================================================
+  # STEP 6: MIXING PARAMETER OPTIMIZATION (α)
+  # ==============================================================================
+
+    # Define grid of α values for evaluation
+        alpha_grid <- seq(0, 1, by = 0.05)
+  
+    # Use ClustGeo's choicealpha function for systematic evaluation
+        cat("Evaluating mixing parameter α across", length(alpha_grid), "values...\n")
+  
+        alpha_results <- ClustGeo::choicealpha(
+            D0 = D0,
+            D1 = D1,
+            range.alpha = alpha_grid,
+            K = optimal_k,
+            graph = FALSE
+        )
+
+    # Extract and properly format the results
+        alpha_df <- data.frame(
+            alpha = alpha_grid,
+            Q0 = alpha_results$Q[, "Q0"],
+            Q1 = alpha_results$Q[, "Q1"],
+            Q0_norm = alpha_results$Qnorm[, "Q0norm"],
+            Q1_norm = alpha_results$Qnorm[, "Q1norm"]
+        )
+        
+    # Find optimal α using multiple criteria
+  
+      # Method 1: Maximum product of normalized qualities
+          alpha_df$product_norm <- alpha_df$Q0_norm * alpha_df$Q1_norm
+    
+      # Method 2: Minimum distance from ideal point (1,1) in normalized space
+          alpha_df$distance_ideal <- sqrt((1 - alpha_df$Q0_norm)^2 + (1 - alpha_df$Q1_norm)^2)
+  
+    # Select optimal α
+        alpha_product_opt <- alpha_grid[which.max(alpha_df$product_norm)]
+        alpha_distance_opt <- alpha_grid[which.min(alpha_df$distance_ideal)]
+        
+        # Filter for viable alphas (ecological quality >= 90%, geographical quality >= 10%)
+            viable_alphas <- alpha_df %>%
+                dplyr::filter(
+                    Q1_norm >= 0.1,    # At least 10% geographical improvement
+                    Q0_norm >= 0.9     # No more than 10% ecological loss
+                )
+        
+        if (nrow(viable_alphas) > 0) {
+            optimal_alpha <- viable_alphas$alpha[which.max(viable_alphas$product_norm)]
+        } else {
+            optimal_alpha <- alpha_product_opt  # Fallback to product maximum
+        }
+  
+        cat("Alpha optimization results:\n")
+        cat("  Product optimization α =", alpha_product_opt, "\n")
+        cat("  Distance optimization α =", alpha_distance_opt, "\n")
+        cat("  Final selected α =", optimal_alpha, "\n")
+  
+    # Create comprehensive α selection visualization
+        alpha_plot <- ggplot(alpha_df, aes(x = alpha)) +
+            geom_line(aes(y = Q0_norm, color = "Ecological"), linewidth = 1) +
+            geom_line(aes(y = Q1_norm, color = "Geographical"), linewidth = 1) +
+            geom_vline(xintercept = optimal_alpha, linetype = "dashed", color = "red", linewidth = 1) +
+            geom_point(
+                data = alpha_df[alpha_df$alpha == optimal_alpha, ], 
+                aes(y = Q0_norm), color = "red", size = 3
+            ) +
+            geom_point(
+                data = alpha_df[alpha_df$alpha == optimal_alpha, ], 
+                aes(y = Q1_norm), color = "red", size = 3
+            ) +
+            scale_color_manual(values = c("Ecological" = "#2E8B57", "Geographical" = "#4169E1")) +
+            labs(
+                title = "Mixing Parameter (α) Optimization",
+                subtitle = paste(
+                    "Optimal α =", optimal_alpha, 
+                    "| Ecological =", round(alpha_df$Q0_norm[alpha_df$alpha == optimal_alpha], 3),
+                    "| Geographical =", round(alpha_df$Q1_norm[alpha_df$alpha == optimal_alpha], 3)
+                ),
+                x = "Mixing Parameter (α)",
+                y = "Normalized Quality (%)",
+                color = "Homogeneity Type"
+            ) +
+            theme_minimal() +
+            theme(legend.position = "bottom")
+  
+        print(alpha_plot)
+
+  # ==============================================================================
+  # STEP 7: FINAL CLUSTERING WITH OPTIMAL PARAMETERS
+  # ==============================================================================
+
+    # Perform final clustering with optimal parameters
+        final_tree <- ClustGeo::hclustgeo(D0, D1, alpha = optimal_alpha)
+        final_clusters <- cutree(final_tree, k = optimal_k)
+  
+    # Create results summary dataframe
+        results_summary <- data.frame(
+            site_id = rownames(site_species_final),
+            longitude = site_centroids_final$centroid_x,
+            latitude = site_centroids_final$centroid_y,
+            n_records = site_centroids_final$n_records,
+            species_richness = rowSums(site_species_final),
+            bioregion = final_clusters,
+            stringsAsFactors = FALSE
+        )
+  
+    # Convert to spatial object for mapping
+        results_sf <- sf::st_as_sf(
+            results_summary, 
+            coords = c("longitude", "latitude"), 
+            crs = sf::st_crs(combined_species_data)
+        )
+  
+        cat("Final clustering summary:\n")
+        cat("  Number of bioregions:", length(unique(final_clusters)), "\n")
+        cat("  Sites per bioregion:", paste(table(final_clusters), collapse = ", "), "\n")
+  
+    # Calculate bioregion summaries
+        if (length(unique(final_clusters)) > 0 && !all(is.na(final_clusters))) {
+            bioregion_summary <- results_summary %>%
+                dplyr::group_by(bioregion) %>%
+                dplyr::summarise(
+                    n_sites = dplyr::n(),
+                    total_records = sum(n_records),
+                    mean_richness = round(mean(species_richness), 2),
+                    min_richness = min(species_richness),
+                    max_richness = max(species_richness),
+                    .groups = 'drop'
+                )
+            
+            print(bioregion_summary)
+        } else {
+            cat("Error: No valid bioregions created\n")
+            bioregion_summary <- data.frame()
+        }
+
+  # ==============================================================================
+  # STEP 8: VISUALIZATION AND VALIDATION
+  # ==============================================================================
+
+    # Create main bioregionalization map
+        bioregion_map <- ggplot(results_sf) +
+            geom_sf(aes(color = factor(bioregion), size = species_richness), alpha = 0.8) +
+            scale_color_viridis_d(name = "Bioregion", option = "turbo") +
+            scale_size_continuous(name = "Species\nRichness", range = c(1, 4)) +
+            labs(
+                title = "Tick Species Bioregions in Georgia",
+                subtitle = paste0("ClustGeo method | K = ", optimal_k, ", α = ", optimal_alpha,
+                                " | ", nrow(results_summary), " sites"),
+                caption = "Spatially-constrained clustering balancing ecological and geographical similarity"
+            ) +
+            theme_minimal() +
+            theme(
+                axis.text = element_blank(),
+                axis.ticks = element_blank(),
+                panel.grid = element_blank()
+            )
+  
+        print(bioregion_map)
+  
+    # Validate clustering quality
+        if (length(unique(final_clusters)) > 1 && !all(is.na(final_clusters))) {
+            final_sil_score <- mean(cluster::silhouette(final_clusters, D0)[,3])
+            eco_homogeneity <- alpha_df$Q0[alpha_df$alpha == optimal_alpha]
+            geo_homogeneity <- alpha_df$Q1[alpha_df$alpha == optimal_alpha]
+        } else {
+            final_sil_score <- NA
+            eco_homogeneity <- NA
+            geo_homogeneity <- NA
+        }
+  
+        cat("\nClustering validation:\n")
+        cat("  Silhouette score:", round(final_sil_score, 3), "\n")
+        cat("  Ecological homogeneity:", round(eco_homogeneity, 3), "\n")
+        cat("  Geographical homogeneity:", round(geo_homogeneity, 3), "\n")
+  
+    # Create bioregion composition analysis
+        if (length(unique(final_clusters)) > 1 && !all(is.na(final_clusters))) {
+            bioregion_composition <- purrr::map(1:optimal_k, function(region_id) {
+                region_sites <- which(final_clusters == region_id)
+                if (length(region_sites) > 0) {
+                    species_prevalence <- colMeans(site_species_final[region_sites, , drop = FALSE])
+                    species_prevalence[species_prevalence > 0]
+                } else {
+                    numeric(0)
+                }
+            }) %>%
+                purrr::set_names(paste0("Region_", 1:optimal_k))
+            
+            cat("\nBioregion species composition (prevalence > 0):\n")
+            purrr::iwalk(bioregion_composition, function(comp, region) {
+                cat(region, ":", length(comp), "species\n")
+                if (length(comp) > 0) {
+                    cat("  Top species:", paste(names(sort(comp, decreasing = TRUE))[1:min(3, length(comp))], 
+                                              collapse = ", "), "\n")
+                }
+            })
+        } else {
+            bioregion_composition <- list()
+            cat("\nNo valid bioregions for composition analysis\n")
+        }
+
+  # ==============================================================================
+  # STEP 9: EXPORT RESULTS (FIXED VERSION)
+  # ==============================================================================
+
+    # Create the missing clustering_metrics object
+        clustering_metrics <- ensemble_diag
+
+    # Create the cluster evaluation plot
+        cluster_eval_plot <- (p1 | p2) / (p3 | p4)
+
+    # Create comprehensive results object
+        clustgeo_results <- list(
+            # Input parameters
+                parameters = list(
+                    n_sites = nrow(site_species_final),
+                    n_species = ncol(site_species_final),
+                    optimal_k = optimal_k,
+                    optimal_alpha = optimal_alpha,
+                    method = "ClustGeo with Jaccard + Geographic distance"
+                ),
+            
+            # Clustering results
+                clustering = list(
+                    bioregions = final_clusters,
+                    tree = final_tree,
+                    results_summary = results_summary,
+                    results_sf = results_sf
+                ),
+            
+            # Quality metrics
+                validation = list(
+                    silhouette_score = final_sil_score,
+                    ecological_homogeneity = eco_homogeneity,
+                    geographical_homogeneity = geo_homogeneity,
+                    alpha_evaluation = alpha_df,
+                    cluster_evaluation = clustering_metrics
+                ),
+            
+            # Biological interpretation
+                bioregions = list(
+                    summary = bioregion_summary,
+                    composition = bioregion_composition,
+                    site_species_matrix = site_species_final
+                ),
+            
+            # Dissimilarity matrices
+                dissimilarities = list(
+                    D0_ecological = D0,
+                    D1_geographical = D1
+                ),
+            
+            # Visualizations
+                plots = list(
+                    bioregion_map = bioregion_map,
+                    alpha_optimization = alpha_plot,
+                    cluster_evaluation = cluster_eval_plot
+                )
+        )
+
+    # Save results
+        assign("clustgeo_bioregionalization", clustgeo_results, envir = .GlobalEnv)
+
+        cat("Results saved to 'clustgeo_bioregionalization' object\n")
+        cat("\nClustGeo bioregionalization completed successfully!\n")
+        cat("================================================================================\n")
+
+    # Print final summary
+        cat("\nFINAL SUMMARY:\n")
+        cat("Method: ClustGeo spatially-constrained hierarchical clustering\n")
+        cat("Sites analyzed:", nrow(site_species_final), "\n")
+        cat("Species included:", ncol(site_species_final), "\n") 
+        cat("Bioregions identified:", optimal_k, "\n")
+        cat("Mixing parameter α:", optimal_alpha, "\n")
+        cat("Ecological vs Geographical balance:", round(eco_homogeneity, 3), "vs", round(geo_homogeneity, 3), "\n")
+        cat("Overall clustering quality (silhouette):", round(final_sil_score, 3), "\n")
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 15. BIOREGIONALIZATION ANALYTIC
+-----------------------------------------------------------------------------
+```{r BIOREGIONALIZATION ANALYTICS}
+
+# ==============================================================================
+# BIOREGIONALIZATION DETAILED ANALYSIS
+# ==============================================================================
+
+    # Extract key objects from clustgeo results
+        clustgeo_results <- get("clustgeo_bioregionalization")
+        results_summary <- clustgeo_results$clustering$results_summary
+        site_species_final <- clustgeo_results$bioregions$site_species_matrix
+        final_clusters <- clustgeo_results$clustering$bioregions
+        env_data_final <- get("env_data_final")  # From the original analysis
+
+    # --- ENVIRONMENTAL CHARACTERIZATION OF BIOREGIONS ---
+    
+        # Calculate environmental means and ranges for each bioregion
+            env_bioregion_stats <- purrr::map_dfr(1:max(final_clusters), function(region_id) {
+                region_sites <- which(final_clusters == region_id)
+                region_env <- env_data_final[region_sites, , drop = FALSE]
+                
+                # Calculate statistics for key environmental variables
+                    key_vars <- c("Annual_Mean_Temperature", "Annual_Precipitation", "Elevation", 
+                                 "NDVI_mean", "SoilpH", "landscape_diversity_shdi")
+                    available_vars <- intersect(key_vars, colnames(region_env))
+                
+                # Create summary for available variables
+                    env_summary <- purrr::map_dfr(available_vars, function(var) {
+                        values <- region_env[, var]
+                        tibble::tibble(
+                            bioregion = region_id,
+                            variable = var,
+                            mean_value = round(mean(values, na.rm = TRUE), 2),
+                            sd_value = round(sd(values, na.rm = TRUE), 2),
+                            min_value = round(min(values, na.rm = TRUE), 2),
+                            max_value = round(max(values, na.rm = TRUE), 2),
+                            range_text = paste0(min_value, "-", max_value)
+                        )
+                    })
+                
+                return(env_summary)
+            })
+        
+        # Pivot to wider format for easier interpretation
+            env_by_region <- env_bioregion_stats %>%
+                dplyr::select(bioregion, variable, mean_value) %>%
+                tidyr::pivot_wider(names_from = variable, values_from = mean_value, 
+                                  names_prefix = "mean_")
+
+    # --- STATISTICAL INDICATOR SPECIES ANALYSIS USING INDICSPECIES ---
+    
+        # Prepare data for indicspecies analysis
+            # Create cluster vector for sites
+                cluster_vector <- final_clusters
+                names(cluster_vector) <- rownames(site_species_final)
+        
+        # Run IndVal analysis using literature-recommended parameters
+            # Using IndVal.g (group-equalized) method with 9999 permutations for robust results
+                indval_results <- indicspecies::multipatt(
+                    site_species_final,             # Sites x species matrix (standard format)
+                    cluster = cluster_vector,       # Bioregion assignments
+                    func = "IndVal.g",              # Group-equalized IndVal (recommended)
+                    duleg = TRUE,                   # Include Dufrene-Legendre components
+                    control = how(nperm = 9999)     # High permutation count for robust p-values
+                )
+        
+        # Extract and format indicator species results
+            # Extract from the sign matrix which contains significance results
+            
+        # Create comprehensive indicator species dataframe
+            indicator_species_results <- purrr::map_dfr(1:max(final_clusters), function(region_id) {
+                # Get species that are significant indicators for this region
+                    region_col <- paste0("s.", region_id)
+                    
+                # Find species with significant associations to this region
+                    significant_species <- rownames(indval_results$sign)[
+                        indval_results$sign[, region_col] == 1 & 
+                        indval_results$sign[, "p.value"] <= 0.1
+                    ]
+                
+                if (length(significant_species) > 0) {
+                    # Extract statistics for these species
+                        indval_scores <- indval_results$sign[significant_species, "stat"]
+                        p_values <- indval_results$sign[significant_species, "p.value"]
+                        specificity <- indval_results$A[significant_species, region_id]
+                        fidelity <- indval_results$B[significant_species, region_id]
+                    
+                    tibble::tibble(
+                        bioregion = region_id,
+                        species = significant_species,
+                        indval_score = round(indval_scores * 100, 2),  # Convert to percentage
+                        p_value = round(p_values, 4),
+                        specificity = round(specificity, 3),
+                        fidelity = round(fidelity, 3),
+                        significance = case_when(
+                            p_values <= 0.001 ~ "***",
+                            p_values <= 0.01 ~ "**", 
+                            p_values <= 0.05 ~ "*",
+                            p_values <= 0.1 ~ ".",
+                            TRUE ~ ""
+                        ),
+                        strength = case_when(
+                            indval_scores * 100 >= 50 ~ "Highly diagnostic",
+                            indval_scores * 100 >= 25 ~ "Strong indicator",
+                            indval_scores * 100 >= 10 ~ "Moderate indicator",
+                            TRUE ~ "Weak indicator"
+                        )
+                    ) %>%
+                        dplyr::arrange(desc(indval_score))
+                } else {
+                    # No species for this region
+                        tibble::tibble(
+                            bioregion = numeric(0),
+                            species = character(0),
+                            indval_score = numeric(0),
+                            p_value = numeric(0),
+                            specificity = numeric(0),
+                            fidelity = numeric(0),
+                            significance = character(0),
+                            strength = character(0)
+                        )
+                }
+            })
+        
+        # Apply FDR correction across all tests (Benjamini-Hochberg)
+            if (nrow(indicator_species_results) > 0) {
+                indicator_species_results$p_adj <- p.adjust(indicator_species_results$p_value, method = "BH")
+                indicator_species_results$adj_significance <- case_when(
+                    indicator_species_results$p_adj <= 0.001 ~ "***",
+                    indicator_species_results$p_adj <= 0.01 ~ "**",
+                    indicator_species_results$p_adj <= 0.05 ~ "*",
+                    indicator_species_results$p_adj <= 0.1 ~ ".",
+                    TRUE ~ ""
+                )
+            }
+
+    # --- SPECIES COMPOSITION AND PREVALENCE ANALYSIS ---
+    
+        # Calculate species prevalence within each bioregion for context
+            species_by_region <- purrr::map(1:max(final_clusters), function(region_id) {
+                region_sites <- which(final_clusters == region_id)
+                region_matrix <- site_species_final[region_sites, , drop = FALSE]
+                
+                # Calculate prevalence (proportion of sites where species occurs)
+                    prevalence <- colMeans(region_matrix) * 100  # Convert to percentage
+                    
+                # Filter to species that occur in this region
+                    present_species <- prevalence[prevalence > 0]
+                    
+                tibble::tibble(
+                    bioregion = region_id,
+                    species = names(present_species),
+                    prevalence = round(as.numeric(present_species), 1),
+                    n_sites_present = round(prevalence * length(region_sites) / 100)
+                ) %>%
+                    dplyr::arrange(desc(prevalence))
+            }) %>%
+                purrr::set_names(paste0("Region_", 1:max(final_clusters)))
+
+    # --- BIODIVERSITY CALCULATIONS BY BIOREGION ---
+    
+        # Get the correct occurrence point counts from the original bioregion summary
+            original_bioregion_summary <- clustgeo_results$bioregions$summary
+    
+        # Calculate proper diversity metrics for each bioregion
+            diversity_by_region <- purrr::map_dfr(1:max(final_clusters), function(region_id) {
+                region_sites <- which(final_clusters == region_id)
+                region_matrix <- site_species_final[region_sites, , drop = FALSE]
+                
+                # Get correct occurrence points from original summary
+                    region_occurrence_points <- original_bioregion_summary$total_records[
+                        original_bioregion_summary$bioregion == region_id
+                    ]
+                
+                # Calculate species occurrence counts across all sites in region
+                    species_counts <- colSums(region_matrix)
+                    
+                # Remove species not present in this region
+                    present_counts <- species_counts[species_counts > 0]
+                    
+                # Calculate proportional abundance for each species
+                    prop_abundance <- present_counts / sum(present_counts)
+                
+                # Basic measures
+                    S <- length(present_counts)  # Species richness
+                    total_abundance <- sum(present_counts)
+                
+                # Shannon diversity components
+                    shannon_components <- ifelse(prop_abundance > 0, 
+                                               -prop_abundance * log(prop_abundance), 0)
+                    shannon_diversity <- sum(shannon_components)
+                    shannon_evenness <- shannon_diversity / log(S)
+                
+                # Simpson diversity components
+                    simpson_components <- prop_abundance^2
+                    simpson_dominance <- sum(simpson_components)      # Original Simpson λ
+                    gini_simpson <- 1 - simpson_dominance             # Gini-Simpson (1-λ)
+                    simpson_evenness <- (1 / simpson_dominance) / S
+                
+                # Dominance measures
+                    berger_parker <- max(prop_abundance)
+                
+                # Hill numbers (effective species diversity)
+                    hill_q0 <- S                                      # Species richness
+                    hill_q1 <- exp(shannon_diversity)                # Shannon effective species
+                    hill_q2 <- 1 / simpson_dominance                 # Simpson effective species
+                
+                # Mean richness per site in this region
+                    mean_site_richness <- mean(rowSums(region_matrix))
+                
+                tibble::tibble(
+                    bioregion = region_id,
+                    n_sites = length(region_sites),
+                    n_occurrence_points = region_occurrence_points,
+                    total_species = S,
+                    total_abundance = total_abundance,
+                    mean_richness_per_site = round(mean_site_richness, 2),
+                    shannon_diversity = round(shannon_diversity, 3),
+                    shannon_evenness = round(shannon_evenness, 3),
+                    simpson_dominance = round(simpson_dominance, 3),
+                    gini_simpson = round(gini_simpson, 3),
+                    simpson_evenness = round(simpson_evenness, 3),
+                    berger_parker = round(berger_parker, 3),
+                    hill_q0 = hill_q0,
+                    hill_q1 = round(hill_q1, 2),
+                    hill_q2 = round(hill_q2, 2)
+                )
+            })
+
+    # --- STATISTICAL TESTS OF BIODIVERSITY DIFFERENCES ---
+        
+        # Create site-level diversity data for statistical testing
+            site_diversity_data <- purrr::map_dfr(1:nrow(site_species_final), function(i) {
+                site_species <- site_species_final[i, ]
+                present_species <- site_species[site_species > 0]
+                
+                if (length(present_species) > 0) {
+                    prop_abundance <- present_species / sum(present_species)
+                    S_site <- length(present_species)
+                    
+                    # Calculate diversity metrics for this site
+                        shannon_site <- -sum(prop_abundance * log(prop_abundance))
+                        simpson_site <- 1 - sum(prop_abundance^2)  # Using Gini-Simpson
+                        
+                    tibble::tibble(
+                        site_id = rownames(site_species_final)[i],
+                        bioregion = as.factor(final_clusters[i]),
+                        richness = S_site,
+                        shannon = shannon_site,
+                        simpson = simpson_site
+                    )
+                } else {
+                    tibble::tibble(
+                        site_id = rownames(site_species_final)[i],
+                        bioregion = as.factor(final_clusters[i]),
+                        richness = 0,
+                        shannon = 0,
+                        simpson = 0
+                    )
+                }
+            })
+        
+        # Perform comprehensive statistical tests for each diversity metric
+            diversity_statistical_tests <- purrr::map_dfr(c("richness", "shannon", "simpson", "hill_q1", "hill_q2"), function(metric) {
+                # Determine the column name for Hill numbers
+                    if (metric == "hill_q1") {
+                        metric_data <- diversity_by_region$hill_q1[match(site_diversity_data$bioregion, diversity_by_region$bioregion)]
+                        site_diversity_data$hill_q1 <- metric_data
+                        formula_str <- "hill_q1 ~ bioregion"
+                    } else if (metric == "hill_q2") {
+                        metric_data <- diversity_by_region$hill_q2[match(site_diversity_data$bioregion, diversity_by_region$bioregion)]
+                        site_diversity_data$hill_q2 <- metric_data
+                        formula_str <- "hill_q2 ~ bioregion"
+                    } else {
+                        formula_str <- paste(metric, "~ bioregion")
+                    }
+                
+                # ANOVA test
+                    aov_result <- aov(as.formula(formula_str), data = site_diversity_data)
+                    aov_summary <- summary(aov_result)
+                    
+                    f_stat <- aov_summary[[1]]$`F value`[1]
+                    p_value <- aov_summary[[1]]$`Pr(>F)`[1]
+                    df_between <- aov_summary[[1]]$Df[1]
+                    df_within <- aov_summary[[1]]$Df[2]
+                
+                # Post-hoc Tukey HSD test if ANOVA is significant
+                    tukey_result <- NULL
+                    if (p_value < 0.05) {
+                        tukey_result <- TukeyHSD(aov_result)
+                        significant_pairs <- sum(tukey_result$bioregion[, "p adj"] < 0.05)
+                        total_pairs <- nrow(tukey_result$bioregion)
+                    } else {
+                        significant_pairs <- 0
+                        total_pairs <- choose(length(unique(site_diversity_data$bioregion)), 2)
+                    }
+                
+                # Kruskal-Wallis non-parametric test
+                    kw_result <- kruskal.test(as.formula(formula_str), data = site_diversity_data)
+                    kw_statistic <- kw_result$statistic
+                    kw_p_value <- kw_result$p.value
+                
+                # Effect size calculation (eta-squared)
+                    ss_between <- aov_summary[[1]]$`Sum Sq`[1]
+                    ss_total <- sum(aov_summary[[1]]$`Sum Sq`)
+                    eta_squared <- ss_between / ss_total
+                
+                tibble::tibble(
+                    diversity_metric = metric,
+                    # ANOVA results
+                    f_statistic = round(f_stat, 3),
+                    anova_p_value = round(p_value, 4),
+                    df_between = df_between,
+                    df_within = df_within,
+                    eta_squared = round(eta_squared, 3),
+                    # Kruskal-Wallis results
+                    kw_statistic = round(kw_statistic, 3),
+                    kw_p_value = round(kw_p_value, 4),
+                    # Post-hoc results
+                    significant_pairs = significant_pairs,
+                    total_pairs = total_pairs,
+                    # Interpretation
+                    anova_significant = p_value < 0.05,
+                    kw_significant = kw_p_value < 0.05,
+                    effect_size = case_when(
+                        eta_squared >= 0.14 ~ "Large",
+                        eta_squared >= 0.06 ~ "Medium", 
+                        eta_squared >= 0.01 ~ "Small",
+                        TRUE ~ "Negligible"
+                    )
+                )
+            })
+
+    # --- ENVIRONMENTAL DISTINCTIVENESS ANALYSIS ---
+    
+        # Identify which environmental variables best separate the regions
+            env_separation <- purrr::map_dfr(colnames(env_data_final), function(var) {
+                # Test ANOVA across bioregions
+                    var_data <- data.frame(
+                        env_value = env_data_final[, var],
+                        bioregion = as.factor(final_clusters)
+                    )
+                
+                # Perform ANOVA
+                    aov_result <- tryCatch({
+                        aov(env_value ~ bioregion, data = var_data)
+                    }, error = function(e) NULL)
+                
+                if (!is.null(aov_result)) {
+                    aov_summary <- summary(aov_result)
+                    f_stat <- aov_summary[[1]]$`F value`[1]
+                    p_value <- aov_summary[[1]]$`Pr(>F)`[1]
+                    
+                    # Calculate effect size
+                        ss_between <- aov_summary[[1]]$`Sum Sq`[1]
+                        ss_total <- sum(aov_summary[[1]]$`Sum Sq`)
+                        eta_squared <- ss_between / ss_total
+                    
+                    # Calculate between-group variance
+                        group_means <- tapply(var_data$env_value, var_data$bioregion, mean, na.rm = TRUE)
+                        between_var <- var(group_means, na.rm = TRUE)
+                    
+                    tibble::tibble(
+                        variable = var,
+                        f_statistic = round(f_stat, 3),
+                        p_value = round(p_value, 4),
+                        eta_squared = round(eta_squared, 3),
+                        between_variance = round(between_var, 3),
+                        significant = p_value < 0.05,
+                        effect_size = case_when(
+                            eta_squared >= 0.14 ~ "Large",
+                            eta_squared >= 0.06 ~ "Medium",
+                            eta_squared >= 0.01 ~ "Small",
+                            TRUE ~ "Negligible"
+                        )
+                    )
+                } else {
+                    tibble::tibble(
+                        variable = var,
+                        f_statistic = NA,
+                        p_value = NA,
+                        eta_squared = NA,
+                        between_variance = NA,
+                        significant = FALSE,
+                        effect_size = "Error"
+                    )
+                }
+            }) %>%
+                dplyr::filter(!is.na(f_statistic)) %>%
+                dplyr::arrange(desc(f_statistic))
+
+    # --- COMPILE COMPREHENSIVE RESULTS ---
+    
+        bioregion_detailed_analysis <- list(
+            environmental_characterization = list(
+                by_region_summary = env_by_region,
+                detailed_stats = env_bioregion_stats,
+                separation_analysis = env_separation
+            ),
+            species_composition = list(
+                by_region = species_by_region,
+                indicator_species_statistical = indicator_species_results,
+                indval_full_results = indval_results
+            ),
+            diversity_analysis = list(
+                regional_diversity = diversity_by_region,
+                site_level_data = site_diversity_data,
+                statistical_tests = diversity_statistical_tests
+            ),
+            bioregion_summary = clustgeo_results$bioregions$summary
+        )
+    
+    # Export to global environment
+        assign("bioregion_detailed_analysis", bioregion_detailed_analysis, envir = .GlobalEnv)
+
+    # --- ENHANCED SUMMARY STATISTICS FOR MANUSCRIPT ---
+    
+        cat("=== ENHANCED BIOREGIONALIZATION ANALYSIS ===\n\n")
+        
+        cat("1. STATISTICAL INDICATOR SPECIES ANALYSIS (IndVal.g method, n=9999 permutations)\n")
+        cat("----------------------------------------------------------------\n")
+        if (nrow(indicator_species_results) > 0) {
+            # Count indicators by strength and significance
+                strong_indicators <- sum(indicator_species_results$indval_score >= 25 & 
+                                       indicator_species_results$p_adj <= 0.05)
+                total_indicators <- nrow(indicator_species_results %>% 
+                                       dplyr::filter(p_adj <= 0.05))
+                
+            cat("Total significant indicators (FDR ≤ 0.05):", total_indicators, "\n")
+            cat("Strong indicators (IndVal ≥ 25%):", strong_indicators, "\n\n")
+            
+            # Display top indicators by region
+                purrr::walk(1:max(final_clusters), function(region_id) {
+                    region_indicators <- indicator_species_results %>% 
+                        dplyr::filter(bioregion == region_id, p_adj <= 0.05) %>%
+                        head(3)
+                    
+                    if (nrow(region_indicators) > 0) {
+                        cat("Region", region_id, "top indicators:\n")
+                        purrr::pwalk(list(region_indicators$species, 
+                                        region_indicators$indval_score,
+                                        region_indicators$adj_significance,
+                                        region_indicators$strength),
+                                   function(sp, score, sig, strength) {
+                                       cat("  ", sp, ": IndVal =", score, "% ", sig, " (", strength, ")\n")
+                                   })
+                    } else {
+                        cat("Region", region_id, ": No significant indicators\n")
+                    }
+                })
+        } else {
+            cat("No significant indicator species found\n")
+        }
+        cat("\n")
+        
+        cat("2. BIODIVERSITY STATISTICAL COMPARISONS\n")
+        cat("----------------------------------------\n")
+        purrr::pwalk(list(diversity_statistical_tests$diversity_metric, 
+                         diversity_statistical_tests$f_statistic,
+                         diversity_statistical_tests$anova_p_value,
+                         diversity_statistical_tests$eta_squared,
+                         diversity_statistical_tests$effect_size,
+                         diversity_statistical_tests$significant_pairs,
+                         diversity_statistical_tests$total_pairs,
+                         diversity_statistical_tests$anova_significant), 
+                    function(metric, f_stat, p_val, eta, effect, sig_pairs, total_pairs, is_sig) {
+                        sig_text <- ifelse(p_val < 0.001, "***", 
+                                         ifelse(p_val < 0.01, "**",
+                                               ifelse(p_val < 0.05, "*", "")))
+                        cat(stringr::str_to_title(metric), "diversity:\n")
+                        cat("  ANOVA: F =", f_stat, ", p =", p_val, sig_text, 
+                            " (η² =", eta, ",", effect, "effect)\n")
+                        if (is_sig) {
+                            cat("  Post-hoc:", sig_pairs, "of", total_pairs, "pairwise comparisons significant\n")
+                        } else {
+                            cat("  Post-hoc: Not performed (ANOVA not significant)\n")
+                        }
+                    })
+        cat("\n")
+        
+        cat("3. ENVIRONMENTAL SEPARATION ANALYSIS\n")
+        cat("------------------------------------\n")
+        cat("Top environmental variables separating bioregions:\n")
+        top_env_vars <- head(env_separation %>% dplyr::filter(significant == TRUE), 5)
+        if (nrow(top_env_vars) > 0) {
+            purrr::pwalk(list(top_env_vars$variable, 
+                             top_env_vars$f_statistic, 
+                             top_env_vars$eta_squared,
+                             top_env_vars$effect_size), 
+                        function(var, f_stat, eta, effect) {
+                            cat("  ", var, ": F =", f_stat, " (η² =", eta, ",", effect, "effect)\n")
+                        })
+        } else {
+            cat("  No environmental variables significantly separate bioregions\n")
+        }
+        cat("\n")
+        
+        cat("4. BIOREGION DIVERSITY SUMMARY\n")
+        cat("------------------------------\n")
+        purrr::pwalk(list(diversity_by_region$bioregion, 
+                         diversity_by_region$n_sites,
+                         diversity_by_region$n_occurrence_points,
+                         diversity_by_region$total_species, 
+                         diversity_by_region$shannon_diversity,
+                         diversity_by_region$gini_simpson,
+                         diversity_by_region$hill_q1,
+                         diversity_by_region$hill_q2), 
+                    function(region, n_sites, n_points, total, shannon, simpson, hill1, hill2) {
+                        cat("Region", region, "(", n_sites, "sites,", n_points, "occurrence points):\n")
+                        cat("  ", total, "species | Shannon =", shannon, "| Simpson =", simpson, "\n")
+                        cat("  Hill q1 =", hill1, "| Hill q2 =", hill2, "\n")
+                    })
+        cat("\n")
+        
+        cat("5. ENVIRONMENTAL CHARACTERIZATION (KEY VARIABLES)\n")
+        cat("-------------------------------------------------\n")
+        key_summary_vars <- c("Annual_Mean_Temperature", "Annual_Precipitation", "Elevation")
+        available_summary_vars <- intersect(key_summary_vars, env_separation$variable)
+        
+        purrr::walk(available_summary_vars, function(var) {
+            var_stats <- env_bioregion_stats %>% dplyr::filter(variable == var)
+            var_test <- env_separation %>% dplyr::filter(variable == var)
+            cat(var, " (F =", var_test$f_statistic, ", p =", var_test$p_value, "):\n")
+            purrr::pwalk(list(var_stats$bioregion, var_stats$mean_value, var_stats$range_text),
+                        function(region, mean_val, range_val) {
+                            cat("  Region", region, ": mean =", mean_val, ", range =", range_val, "\n")
+                        })
+        })
+        
+        cat("\n=== ANALYSIS COMPLETE ===\n")
+        
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 16. BIOREGIONALIZATION THIESSEN MAP
+-----------------------------------------------------------------------------
+```{r BIOREGIONALIZATION THIESSEN MAP}
+# ==============================================================================
+# STANDALONE DELDIR BIOREGIONALIZATION MAP CREATION - TWO VERSIONS
+# ==============================================================================
+
+   # Load required packages
+       library(deldir)
+       library(dplyr)
+       library(sf)
+       library(ggplot2)
+       library(viridis)
+
+   # Transform to projected coordinate system for accurate calculations
+       results_sf_proj <- sf::st_transform(results_sf, crs = 32638)  # UTM Zone 38N
+       georgia_boundary_proj <- sf::st_transform(Georgia_Boundary, crs = 32638)
+   
+   # Extract coordinates and site information
+       coords_proj <- sf::st_coordinates(results_sf_proj)
+       site_coords_df <- data.frame(
+           x = coords_proj[, "X"],
+           y = coords_proj[, "Y"],
+           site_id = results_summary$site_id,
+           bioregion = results_summary$bioregion,
+           species_richness = results_summary$species_richness
+       )
+   
+   # Get Georgia boundary box for Thiessen polygon creation
+       georgia_bbox_proj <- sf::st_bbox(georgia_boundary_proj)
+   
+   # Create Thiessen polygons using deldir
+       thiessen_deldir <- deldir::deldir(
+           x = site_coords_df$x,
+           y = site_coords_df$y,
+           rw = c(georgia_bbox_proj$xmin, georgia_bbox_proj$xmax, 
+                  georgia_bbox_proj$ymin, georgia_bbox_proj$ymax),
+           suppressMsge = TRUE
+       )
+   
+   # Convert deldir tiles to sf polygons
+       thiessen_tiles <- deldir::tile.list(thiessen_deldir)
+       
+       tile_to_polygon <- function(tile) {
+           if (length(tile$x) < 3) return(NULL)
+           
+           coords_matrix <- matrix(c(c(tile$x, tile$x[1]), 
+                                   c(tile$y, tile$y[1])), ncol = 2)
+           poly <- sf::st_polygon(list(coords_matrix))
+           return(poly)
+       }
+       
+       polygon_list <- purrr::map(thiessen_tiles, tile_to_polygon) %>%
+           purrr::compact()
+       
+       thiessen_sf <- sf::st_sf(
+           tile_id = 1:length(polygon_list),
+           geometry = sf::st_sfc(polygon_list, crs = 32638)
+       )
+   
+   # Add bioregion information
+       thiessen_with_bioregions <- thiessen_sf %>%
+           dplyr::mutate(
+               site_id = site_coords_df$site_id,
+               bioregion = site_coords_df$bioregion,
+               species_richness = site_coords_df$species_richness
+           )
+   
+   # Clip to Georgia boundary
+       thiessen_clipped <- sf::st_intersection(thiessen_with_bioregions, georgia_boundary_proj)
+   
+   # Dissolve polygons by bioregion
+       bioregion_polygons_proj <- thiessen_clipped %>%
+           dplyr::group_by(bioregion) %>%
+           dplyr::summarise(
+               n_polygons = dplyr::n(),
+               .groups = 'drop'
+           )
+   
+   # Transform back to WGS84
+       bioregion_polygons <- sf::st_transform(bioregion_polygons_proj, crs = 4326)
+       thiessen_clipped_wgs84 <- sf::st_transform(thiessen_clipped, crs = 4326)
+   
+   # VERSION 1: Clean dissolved regions map
+       bioregion_map_clean <- ggplot() +
+           geom_sf(
+               data = bioregion_polygons,
+               aes(fill = factor(bioregion)),
+               alpha = 0.8,
+               color = "white",
+               linewidth = 1.5
+           ) +
+           geom_sf(
+               data = Georgia_Boundary,
+               fill = NA,
+               color = "black",
+               linewidth = 2
+           ) +
+           geom_sf(
+               data = results_sf,
+               aes(size = species_richness),
+               color = "black",
+               alpha = 0.9
+           ) +
+           scale_fill_viridis_d(
+               name = "Bioregion",
+               option = "turbo",
+               begin = 0.1,
+               end = 0.9,
+               guide = "none"
+           ) +
+           scale_size_continuous(
+               name = "Species Richness",
+               range = c(1, 4),
+               guide = "none"
+           ) +
+           theme_void() +
+           theme(
+               panel.background = element_rect(fill = "white", color = NA),
+               plot.background = element_rect(fill = "white", color = NA)#,
+               #plot.margin = margin(0, 0, 0, 0)
+           )
+   
+   # VERSION 2: Map with Thiessen polygon boundaries visible
+       
+        jenks_breaks <- classIntervals(
+            results_sf$species_richness,
+            n = 3,
+            style = "jenks"
+        )
+        
+        # Create a factor variable with Jenks break categories
+          results_sf <- results_sf |>
+              dplyr::mutate(
+                  richness_class = cut(
+                      species_richness,
+                      breaks = jenks_breaks$brks,
+                      include.lowest = TRUE,
+                      labels = FALSE
+                  )
+              )
+
+          bioregion_map_thiessen <- ggplot() +
+              geom_sf(
+                  data = thiessen_clipped_wgs84,
+                  aes(fill = factor(bioregion)),
+                  alpha = 0.7,
+                  color = "white",
+                  linewidth = 0.3
+              ) +
+              geom_sf(
+                  data = bioregion_polygons,
+                  fill = NA,
+                  color = "black",
+                  linewidth = 1.5
+              ) +
+              geom_sf(
+                  data = Georgia_Boundary,
+                  fill = NA,
+                  color = "black",
+                  linewidth = 2
+              ) +
+              geom_sf(
+                  data = results_sf,
+                  aes(size = factor(richness_class)),
+                  color = "black",
+                  alpha = 0.9
+              ) +
+              scale_fill_viridis_d(
+                  name = "Bioregion",
+                  option = "turbo",
+                  begin = 0.1,
+                  end = 0.9,
+                  guide = "none"
+              ) +
+              scale_size_manual(
+                  name = "Species Richness",
+                  values = c(2, 4.5, 7),
+                  guide = "none"
+              ) +
+              theme_void() +
+              theme(
+                  panel.background = element_rect(fill = "white", color = NA),
+                  plot.background = element_rect(fill = "white", color = NA)
+              )
+   
+   # Create standalone legend for bioregions
+       legend_bioregion <- ggplot() +
+           geom_sf(
+               data = bioregion_polygons,
+               aes(fill = factor(bioregion)),
+               alpha = 0.8
+           ) +
+           scale_fill_viridis_d(
+               name = "Bioregion",
+               option = "turbo",
+               begin = 0.1,
+               end = 0.9,
+               labels = paste("Region", 1:3)
+           ) +
+           theme_void() +
+           theme(
+               legend.position = "bottom",
+               legend.title = element_text(size = 14, face = "bold"),
+               legend.text = element_text(size = 12),
+               legend.key.size = unit(1, "cm"),
+               panel.background = element_rect(fill = "white", color = NA),
+               plot.background = element_rect(fill = "white", color = NA)
+           ) +
+           guides(
+               fill = guide_legend(
+                   title.position = "top",
+                   title.hjust = 0.5,
+                   override.aes = list(alpha = 1)
+               )
+           )
+   
+   # Create standalone legend for species richness
+       legend_richness <- ggplot() +
+           geom_sf(
+               data = results_sf,
+               aes(size = species_richness),
+               color = "black",
+               alpha = 0.9
+           ) +
+           scale_size_continuous(
+               name = "Species Richness",
+               range = c(1, 4),
+               breaks = c(1, 3, 5, 7),
+               labels = c("1", "3", "5", "7")
+           ) +
+           theme_void() +
+           theme(
+               legend.position = "bottom",
+               legend.title = element_text(size = 14, face = "bold"),
+               legend.text = element_text(size = 12),
+               panel.background = element_rect(fill = "white", color = NA),
+               plot.background = element_rect(fill = "white", color = NA)
+           ) +
+           guides(
+               size = guide_legend(
+                   title.position = "top",
+                   title.hjust = 0.5,
+                   override.aes = list(alpha = 1)
+               )
+           )
+   
+   # Display both maps
+       print(bioregion_map_clean)
+       print(bioregion_map_thiessen)
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 17. RAREFACTION
+-----------------------------------------------------------------------------
+```{r RAREFACTION}
+
+  # --- RAREFACTION & ESTIMATORS ---
+  
+    # Retrieve site-species matrix
+      site_species_matrix <- site_species_final
+    
+    # Inspect dimensions and column names
+      cat("Matrix dimensions:", dim(site_species_matrix), "\n")
+      cat("Species columns:\n")
+      print(colnames(site_species_matrix))
+    
+    # Ensure matrix is in proper format
+      site_species_matrix <- as.data.frame(site_species_matrix)
+    
+    # Calculate Chao1 and Jackknife Estimators
+      chao1_estimate <- estimateR(t(site_species_matrix))
+      jack1_estimate <- specpool(site_species_matrix, pool = rep("all", nrow(site_species_matrix)))
+    
+    # Compute mean Chao1 estimate
+      mean_chao1 <- mean(chao1_estimate["S.chao1", ], na.rm = TRUE)
+    
+    # Prepare incidence data for iNEXT (single assemblage)
+      inext_input <- c(nrow(site_species_matrix), colSums(site_species_matrix))
+      inext_input <- inext_input[inext_input > 0]  # remove species never observed
+      inext_result <- iNEXT(inext_input, q = 0, datatype = "incidence_freq")
+    
+    # Plot accumulation curve and overlay estimates
+      specacc <- specaccum(site_species_matrix, method = "random")
+    
+    # Plot accumulation
+      plot(specacc, ci.type = "polygon", col = "darkgreen", lwd = 2, ci.lty = 0, ci.col = "lightgreen")
+      legend("bottomright", legend = c("Accumulation", "Chao1", "Jackknife1"), col = c("darkgreen", "blue", "purple"), pch = c(NA, 16, 17), lty = c(1, NA, NA))
+    
+    # Plot iNEXT (single assemblage)
+      print(
+        ggiNEXT(inext_result, type = 1) +
+          theme_minimal() +
+          ggtitle("iNEXT Species Accumulation Curve")
+      )
+    
+    # Output estimates
+      list(
+        Chao1 = chao1_estimate,
+        Jackknife1 = jack1_estimate,
+        iNEXT_summary = inext_result$AsyEst
+      )
+
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 18. NETWORK ANALYSIS
+-----------------------------------------------------------------------------
+```{r NETWORK ANALYSIS}
+
+# ==============================================================================
+# VEECH CO-OCCURRENCE NETWORK
+# ==============================================================================
+
+    # Transpose and format for cooccur
+        cooc_input <- t(site_species_matrix)
+    
+    # Assign cleaned species names
+        rownames(cooc_input) <- gsub("_", " ", rownames(cooc_input))
+    
+    # Run cooccur analysis
+        co <- cooccur(mat = cooc_input, spp_names = TRUE)
+        co_table <- as.data.frame(print(co))
+    
+    # Define nodes for Veech network
+        veech_nodes <- data.frame(
+            id = 1:nrow(cooc_input),
+            label = rownames(cooc_input),
+            color = "grey",
+            shadow = TRUE
+        )
+    
+    # Define edges for Veech network
+        veech_edges <- data.frame(
+            from = co_table$sp1,
+            to = co_table$sp2,
+            width = 1,
+            color = ifelse(
+                co_table$p_lt <= 0.05, "red",          # Red = significant negative association
+                ifelse(co_table$p_gt <= 0.05, "blue", "green")  # Blue = significant positive, Green = neutral
+            )
+        )
+    
+    # Visualize Veech network
+        veech_network <- visNetwork(nodes = veech_nodes, edges = veech_edges) %>%
+            visIgraphLayout(layout = "layout_with_kk") %>%
+            visNodes(size = 15) %>%
+            visEdges(arrows = "none") %>%
+            visOptions(highlightNearest = TRUE)
+    
+    # Display Veech network
+        print(veech_network)
+
+
+# ==============================================================================
+# COUNT CO-OCCURRENCE NETWORK ANALYSIS
+# ==============================================================================
+        
+    # Ensure binary matrix (presence/absence)
+        site_species_binary <- site_species_final
+        site_species_binary[site_species_binary > 1] <- 1
+    
+    # Clean species names for display
+        colnames(site_species_binary) <- gsub("_", " ", colnames(site_species_binary))
+    
+    # Calculate co-occurrence counts between all species pairs
+        cooccur_counts <- site_species_binary %>%
+            as.matrix() %>%
+            t() %>%                                     # Transpose to species × sites
+            tcrossprod()                                # Matrix multiplication gives co-occurrence counts
+        
+    # Set diagonal to 0 (species don't co-occur with themselves for edge purposes)
+        diag(cooccur_counts) <- 0
+    
+    # Calculate site occurrence counts for each species (node sizes)
+        site_counts <- colSums(site_species_binary)
+    
+    # Create adjacency matrix for network (only keep edges with co-occurrence > threshold)
+        cooccur_threshold <- 1                          # Minimum co-occurrences to show edge
+        adj_matrix <- cooccur_counts
+        adj_matrix[adj_matrix < cooccur_threshold] <- 0
+    
+    # Create igraph object
+        cooccur_graph <- graph_from_adjacency_matrix(
+            adj_matrix, 
+            mode = "undirected", 
+            weighted = TRUE, 
+            diag = FALSE
+        )
+
+    # Function to extract genus and species for sorting
+        extract_genus_species <- function(species_names) {
+            parsed <- stringr::str_split(species_names, " ", simplify = TRUE)
+            data.frame(
+                full_name = species_names,
+                genus = parsed[, 1],
+                species = parsed[, 2],
+                stringsAsFactors = FALSE
+            )
+        }
+
+    # Create alphabetical ordering
+        species_df <- extract_genus_species(names(site_counts))
+        alphabetical_order <- species_df %>%
+            dplyr::arrange(genus, species) %>%
+            dplyr::pull(full_name)
+
+    # Create optimal layout function
+        create_optimal_layout <- function(species_order, radius = 2.5) {
+            n_nodes <- length(species_order)
+            order_indices <- match(species_order, V(cooccur_graph)$name)
+            
+            angles <- seq(0, 2*pi, length.out = n_nodes + 1)[1:n_nodes]
+            
+            layout_matrix <- matrix(0, nrow = vcount(cooccur_graph), ncol = 2)
+            layout_matrix[order_indices, 1] <- radius * cos(angles)
+            layout_matrix[order_indices, 2] <- radius * sin(angles)
+            
+            return(layout_matrix)
+        }
+
+    # Create layout
+        optimal_alpha_layout <- create_optimal_layout(alphabetical_order, radius = 2.5)
+
+    # Set vertex attributes
+        V(cooccur_graph)$name <- names(site_counts)
+        V(cooccur_graph)$site_count <- site_counts[V(cooccur_graph)$name]
+        V(cooccur_graph)$size <- scales::rescale(site_counts[V(cooccur_graph)$name], to = c(6, 20))
+        V(cooccur_graph)$label.cex <- 0.7
+        V(cooccur_graph)$label.color <- "black"
+        V(cooccur_graph)$frame.color <- "white"
+        V(cooccur_graph)$frame.width <- 1.5
+
+    # Set edge attributes
+        edge_weights <- E(cooccur_graph)$weight
+        E(cooccur_graph)$weight_original <- edge_weights
+        E(cooccur_graph)$width <- scales::rescale(edge_weights, to = c(1.5, 8))
+
+    # Create plotting function with no title
+        create_subtle_green_plot <- function(layout_matrix, species_order) {
+            # Simpler green scheme
+                V(cooccur_graph)$color <- colorRampPalette(c("#9cdf8d", "#3541A5"))(max(site_counts))[site_counts[V(cooccur_graph)$name]]
+                E(cooccur_graph)$color <- scales::alpha(colorRampPalette(c("#9cdf8d", "#3541A5"))(max(edge_weights))[edge_weights], 0.6)
+            
+            label_angles <- atan2(layout_matrix[, 2], layout_matrix[, 1])
+            label_degrees <- label_angles * 180 / pi
+            adjusted_angles <- ifelse(abs(label_degrees) > 90, label_degrees + 180, label_degrees)
+            
+            par(mar = c(0.5, 0.5, 0.5, 0.5))            # Removed title margin
+            
+            plot(cooccur_graph,
+                 layout = layout_matrix,
+                 vertex.label = V(cooccur_graph)$name,
+                 vertex.label.dist = 0.8,
+                 vertex.label.degree = adjusted_angles * pi / 180,
+                 vertex.label.cex = 0.7,
+                 edge.curved = 0.2,
+                 main = "",                              # No title
+                 rescale = FALSE,
+                 xlim = c(-3.2, 3.2),
+                 ylim = c(-3.2, 3.2),
+                 asp = 1)
+        }
+
+    # Create the circular network plot
+        create_subtle_green_plot(optimal_alpha_layout, alphabetical_order)
+
+
+
+# ==============================================================================
+# NETWORK ANALYSIS STATISTICS EXTRACTION
+# ==============================================================================
+    # Use objects already created above
+        cooccur_matrix <- cooccur_counts
+        veech_table <- co_table
+        # site_counts already exists from earlier section
+    
+    # --- CO-OCCURRENCE MATRIX STATISTICS ---
+        # Extract upper triangle of matrix (avoid double counting pairs)
+            upper_tri_indices <- upper.tri(cooccur_matrix)
+            cooccur_values <- cooccur_matrix[upper_tri_indices]
+        
+        # Remove zero values for meaningful statistics
+            nonzero_cooccur <- cooccur_values[cooccur_values > 0]
+        
+        # Calculate summary statistics
+            cooccur_stats <- list(
+                total_pairs = length(cooccur_values),
+                pairs_with_cooccurrence = length(nonzero_cooccur),
+                mean_cooccurrence = round(mean(nonzero_cooccur), 2),
+                median_cooccurrence = round(median(nonzero_cooccur), 2),
+                min_cooccurrence = min(nonzero_cooccur),
+                max_cooccurrence = max(nonzero_cooccur),
+                range_cooccurrence = paste(min(nonzero_cooccur), "-", max(nonzero_cooccur))
+            )
+    
+    # --- IDENTIFY TOP CO-OCCURRING SPECIES PAIRS ---
+        # Create data frame of all species pairs with their co-occurrence counts
+            species_names <- rownames(cooccur_matrix)
+            pair_data <- expand.grid(
+                species1 = species_names,
+                species2 = species_names,
+                stringsAsFactors = FALSE
+            ) |>
+                dplyr::filter(species1 < species2) |>
+                dplyr::mutate(
+                    cooccur_count = purrr::map2_dbl(species1, species2, ~ {
+                        cooccur_matrix[.x, .y]
+                    })
+                ) |>
+                dplyr::arrange(desc(cooccur_count))
+        
+        # Top co-occurring pairs
+            top_pairs <- pair_data |>
+                dplyr::slice_head(n = 2) |>
+                dplyr::mutate(
+                    pair_name = paste(species1, "and", species2),
+                    formatted_result = paste0(pair_name, " (n = ", cooccur_count, " sites)")
+                )
+    
+    # --- IDENTIFY LEAST CO-OCCURRING SPECIES ---
+        # Calculate total co-occurrences per species (excluding self)
+            species_cooccur_totals <- purrr::map_dbl(species_names, ~ {
+                species_row <- cooccur_matrix[.x, ]
+                species_col <- cooccur_matrix[, .x]
+                sum(species_row) + sum(species_col) - cooccur_matrix[.x, .x]
+            }) |>
+                purrr::set_names(species_names)
+        
+        # Identify species with lowest co-occurrence
+            least_cooccurring <- species_cooccur_totals |>
+                sort() |>
+                head(3)
+    
+    # --- VEECH POSITIVE ASSOCIATIONS ---
+        # Extract significantly positive associations (p_gt <= 0.05)
+            positive_associations <- veech_table |>
+                dplyr::filter(p_gt <= 0.05) |>
+                dplyr::arrange(p_gt) |>
+                dplyr::mutate(
+                    species_pair = paste(sp1_name, "and", sp2_name),
+                    p_value_formatted = paste0("p = ", round(p_gt, 4))
+                )
+        
+        # Count and format positive associations
+            n_positive_pairs <- nrow(positive_associations)
+            positive_pairs_text <- if (n_positive_pairs > 0) {
+                positive_associations |>
+                    dplyr::slice_head(n = 3) |>
+                    dplyr::pull(species_pair) |>
+                    paste(collapse = ", ")
+            } else {
+                "No significant positive associations detected"
+            }
+    
+    # --- COMPILE RESULTS SUMMARY ---
+        network_analysis_summary <- list(
+            cooccurrence_statistics = cooccur_stats,
+            top_cooccurring_pairs = top_pairs,
+            least_cooccurring_species = least_cooccurring,
+            positive_associations = list(
+                count = n_positive_pairs,
+                pairs = positive_pairs_text,
+                full_table = positive_associations
+            ),
+            species_site_counts = site_counts
+        )
+    
+    # Export to global environment
+        assign("network_analysis_summary", network_analysis_summary, envir = .GlobalEnv)
+    
+    # --- EXPORT COMPLETE ANALYSIS ---
+        assign("complete_cooccurrence_analysis", list(
+            circular_graph = cooccur_graph,
+            circular_layout = optimal_alpha_layout,
+            alphabetical_order = alphabetical_order,
+            veech_analysis = co,
+            veech_table = co_table,
+            veech_network = veech_network,
+            site_counts = site_counts,
+            cooccur_matrix = cooccur_counts
+        ), envir = .GlobalEnv)
+    
+    # --- PRINT KEY RESULTS FOR MANUSCRIPT ---
+        cat("=== COMPLETE CO-OCCURRENCE ANALYSIS FINISHED ===\n\n")
+        cat("Circular network: Clean plot with no title\n")
+        cat("Veech network: Interactive statistical co-occurrence analysis\n\n")
+        
+        cat("=== NETWORK ANALYSIS SUMMARY ===\n\n")
+        cat("Co-occurrence Statistics:\n")
+        cat("  Mean co-occurrence:", cooccur_stats$mean_cooccurrence, "sites\n")
+        cat("  Median co-occurrence:", cooccur_stats$median_cooccurrence, "sites\n")
+        cat("  Range:", cooccur_stats$range_cooccurrence, "sites\n")
+        cat("  Total species pairs with co-occurrence:", cooccur_stats$pairs_with_cooccurrence, "\n\n")
+        
+        cat("Top Co-occurring Species Pairs:\n")
+        purrr::walk(top_pairs$formatted_result, ~ cat("  ", .x, "\n"))
+        cat("\n")
+        
+        cat("Least Co-occurring Species:\n")
+        purrr::iwalk(least_cooccurring, ~ cat("  ", .y, ": ", .x, " total co-occurrences\n"))
+        cat("\n")
+        
+        cat("Veech Positive Associations:\n")
+        cat("  Number of significant positive pairs:", n_positive_pairs, "\n")
+        if (n_positive_pairs > 0) {
+            cat("  Most significant pairs:", positive_pairs_text, "\n")
+        }  
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 19. NETWORK HEATMAP
+-----------------------------------------------------------------------------
+```{r NETWORK HEATMAP}
+
+  # Assume cooccur_counts is your matrix, and colnames/rownames are cleaned
+    mat <- cooccur_counts
+  
+  # Convert to long format for ggplot2
+    cooccur_long <- as.data.frame(mat) %>%
+      mutate(Species1 = rownames(mat)) %>%
+      pivot_longer(
+        cols = -Species1,
+        names_to = "Species2",
+        values_to = "CoOccurrence"
+      )
+  
+  # Order species alphabetically for axes
+    species_order <- sort(unique(cooccur_long$Species1))
+    cooccur_long <- cooccur_long %>%
+      mutate(
+        Species1 = factor(Species1, levels = species_order),
+        Species2 = factor(Species2, levels = species_order)
+      )
+  
+  # Plot heatmap
+    ggplot(cooccur_long, aes(x = Species2, y = Species1, fill = CoOccurrence)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = CoOccurrence), color = "black", size = 3) +
+      scale_fill_gradientn(
+        colours = colorRampPalette(c("#9cdf8d", "#3541A5"))(100),
+        name = "Co-occurrences"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title = element_blank(),
+        panel.grid = element_blank()
+      ) +
+      coord_fixed() +
+      ggtitle("Species Co-occurrence Heatmap")
+
+
+
+```
+
+
+
+-----------------------------------------------------------------------------
+CHUNK 20. DISTRIBUTION OVERLAP ANALYSES
+-----------------------------------------------------------------------------
+```{r DISTRIBUTION OVERLAP ANALYSES}
+
+  # Set output directory
+    output_dir <- "replace w/ output directory"
+  
+  # Define the 7 species
+    target_species <- c("Demar", "Deret", "Haine", "Hapar", "Hapun", "Ixric", "Rhbur")
+  
+  # Species code to full name mapping
+    species_names <- list(
+        "Demar" = "Dermacentor marginatus",
+        "Deret" = "Dermacentor reticulatus", 
+        "Haine" = "Haemaphysalis inermis",
+        "Hapar" = "Haemaphysalis parva",
+        "Hapun" = "Haemaphysalis punctata",
+        "Ixric" = "Ixodes ricinus",
+        "Rhbur" = "Rhipicephalus bursa"
+    )
+
+# =============================================================================
+# 1. NICHE OVERLAP ANALYSIS USING PREDICTION RASTERS
+# =============================================================================
+
+  # Extract prediction rasters for ensemble models
+    ensemble_rasters <- map(target_species, function(sp) {
+        raster_obj <- successful_ensemble_results[[sp]]$ensemble_predictions
+        names(raster_obj) <- sp
+        return(raster_obj)
+    })
+    names(ensemble_rasters) <- target_species
+
+  # Calculate pairwise niche overlap using different metrics
+    niche_overlap_results <- map_dfr(target_species, function(sp1) {
+        map_dfr(target_species, function(sp2) {
+            if (sp1 != sp2) {
+                raster1 <- ensemble_rasters[[sp1]]
+                raster2 <- ensemble_rasters[[sp2]]
+                
+                # Calculate different overlap metrics
+                warren_i <- nicheOverlap(raster1, raster2, stat = 'I')  # Warren's I
+                schoener_d <- nicheOverlap(raster1, raster2, stat = 'D')  # Schoener's D
+                
+                # Pearson correlation between rasters
+                correlation <- cor(values(raster1), values(raster2), use = "complete.obs")
+                
+                # Rank correlation
+                rank_corr <- cor(values(raster1), values(raster2), 
+                               method = "spearman", use = "complete.obs")
+                
+                tibble(
+                    Species1 = sp1,
+                    Species2 = sp2,
+                    Species1_Full = species_names[[sp1]],
+                    Species2_Full = species_names[[sp2]],
+                    Warrens_I = round(warren_i, 3),
+                    Schoeners_D = round(schoener_d, 3),
+                    Pearson_Correlation = round(correlation, 3),
+                    Spearman_Correlation = round(rank_corr, 3)
+                )
+            }
+        }) %>%
+            filter(!is.null(.))
+    })
+
+  # Create symmetric matrices for visualization
+    create_overlap_matrix <- function(overlap_data, metric) {
+        overlap_matrix <- matrix(NA, 
+                               nrow = length(target_species), 
+                               ncol = length(target_species),
+                               dimnames = list(target_species, target_species))
+        
+        for (i in 1:nrow(overlap_data)) {
+            sp1 <- overlap_data$Species1[i]
+            sp2 <- overlap_data$Species2[i]
+            value <- overlap_data[[metric]][i]
+            overlap_matrix[sp1, sp2] <- value
+            overlap_matrix[sp2, sp1] <- value  # Make symmetric
+        }
+        
+        # Fill diagonal with 1s
+        diag(overlap_matrix) <- 1.0
+        
+        return(overlap_matrix)
+    }
+
+  # Create matrices for each metric
+    warrens_matrix <- create_overlap_matrix(niche_overlap_results, "Warrens_I")
+    schoeners_matrix <- create_overlap_matrix(niche_overlap_results, "Schoeners_D")
+    pearson_matrix <- create_overlap_matrix(niche_overlap_results, "Pearson_Correlation")
+    spearman_matrix <- create_overlap_matrix(niche_overlap_results, "Spearman_Correlation")
+
+  # Visualize niche overlap matrices
+    png(file.path(output_dir, "niche_overlap_matrices.png"), 
+        width = 16, height = 12, units = "in", res = 300)
+    
+    par(mfrow = c(2, 2), mar = c(4, 4, 3, 2))
+  
+  # Warren's I
+    corrplot(warrens_matrix, method = "color", type = "upper", 
+             title = "Warren's I Niche Overlap", mar = c(0,0,2,0),
+             col = colorRampPalette(c("white", "lightblue", "darkblue"))(100),
+             addCoef.col = "black", number.cex = 0.8, tl.cex = 0.8)
+  
+  # Schoener's D
+    corrplot(schoeners_matrix, method = "color", type = "upper",
+             title = "Schoener's D Niche Overlap", mar = c(0,0,2,0),
+             col = colorRampPalette(c("white", "lightgreen", "darkgreen"))(100),
+             addCoef.col = "black", number.cex = 0.8, tl.cex = 0.8)
+  
+  # Pearson correlation
+    corrplot(pearson_matrix, method = "color", type = "upper",
+             title = "Pearson Correlation", mar = c(0,0,2,0),
+             col = colorRampPalette(c("red", "white", "blue"))(100),
+             addCoef.col = "black", number.cex = 0.8, tl.cex = 0.8)
+  
+  # Spearman correlation
+    corrplot(spearman_matrix, method = "color", type = "upper",
+             title = "Spearman Correlation", mar = c(0,0,2,0),
+             col = colorRampPalette(c("red", "white", "blue"))(100),
+             addCoef.col = "black", number.cex = 0.8, tl.cex = 0.8)
+    
+    dev.off()
+
+# =============================================================================
+# 2. VARIABLE IMPORTANCE COMPARISON
+# =============================================================================
+
+  # Extract variable importance for all species
+    importance_comparison <- map_dfr(target_species, function(sp) {
+        importance_data <- successful_ensemble_results[[sp]]$ensemble_importance
+        importance_data %>%
+            mutate(species = sp) %>%
+            dplyr::select(species, var, rel.inf, frequency)
+    })
+  
+  # Create importance matrix
+    importance_wide <- importance_comparison %>%
+        dplyr::select(species, var, rel.inf) %>%
+        pivot_wider(names_from = species, values_from = rel.inf, values_fill = 0) %>%
+        column_to_rownames("var")
+  
+  # Create heatmap of variable importance
+    importance_heatmap <- importance_wide %>%
+        rownames_to_column("Variable") %>%
+        pivot_longer(-Variable, names_to = "Species", values_to = "Importance") %>%
+        ggplot(aes(x = Species, y = Variable, fill = Importance)) +
+        geom_tile() +
+        scale_fill_viridis_c(name = "Relative\nImportance (%)") +
+        labs(
+            title = "Variable Importance Comparison Across Species",
+            x = "Species", y = "Environmental Variables"
+        ) +
+        theme_minimal() +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 8)
+        )
+  
+  ggsave(file.path(output_dir, "variable_importance_heatmap.png"),
+         importance_heatmap, width = 12, height = 10, dpi = 300)
+
+# =============================================================================
+# 3. PREDICTION CORRELATION ANALYSIS
+# =============================================================================
+
+  # Extract values from all prediction rasters
+    prediction_values <- map_dfc(target_species, function(sp) {
+        raster_obj <- successful_ensemble_results[[sp]]$ensemble_predictions
+        values_vec <- values(raster_obj)
+        tibble(!!sp := values_vec)
+    }) %>%
+        na.omit()
+  
+  # Calculate correlation matrix
+    pred_cor_matrix <- cor(prediction_values, method = "pearson")
+  
+  # Create correlation plot
+    png(file.path(output_dir, "prediction_correlations.png"), 
+        width = 10, height = 8, units = "in", res = 300)
+    
+    corrplot(pred_cor_matrix, 
+             method = "color", 
+             type = "upper",
+             order = "hclust",
+             col = colorRampPalette(c("red", "white", "blue"))(100),
+             addCoef.col = "black",
+             number.cex = 0.8,
+             tl.cex = 0.8,
+             title = "Prediction Correlations Between Species",
+             mar = c(0,0,2,0))
+    
+    dev.off()
+
+# =============================================================================
+# 4. SUMMARY RESULTS TABLES
+# =============================================================================
+
+  # Create comprehensive comparison table with averages
+    comparison_summary <- tibble(
+        Species_Code = target_species,
+        Species_Name = map_chr(target_species, ~ species_names[[.x]]),
+        Mean_Warrens_I = map_dbl(target_species, function(sp) {
+            mean(niche_overlap_results$Warrens_I[
+                niche_overlap_results$Species1 == sp | 
+                niche_overlap_results$Species2 == sp], na.rm = TRUE)
+        }),
+        Mean_Schoeners_D = map_dbl(target_species, function(sp) {
+            mean(niche_overlap_results$Schoeners_D[
+                niche_overlap_results$Species1 == sp | 
+                niche_overlap_results$Species2 == sp], na.rm = TRUE)
+        }),
+        Mean_Pearson_Correlation = map_dbl(target_species, function(sp) {
+            mean(niche_overlap_results$Pearson_Correlation[
+                niche_overlap_results$Species1 == sp | 
+                niche_overlap_results$Species2 == sp], na.rm = TRUE)
+        }),
+        Mean_Spearman_Correlation = map_dbl(target_species, function(sp) {
+            mean(niche_overlap_results$Spearman_Correlation[
+                niche_overlap_results$Species1 == sp | 
+                niche_overlap_results$Species2 == sp], na.rm = TRUE)
+        })
+    ) %>%
+        mutate(
+            Mean_Warrens_I = round(Mean_Warrens_I, 3),
+            Mean_Schoeners_D = round(Mean_Schoeners_D, 3),
+            Mean_Pearson_Correlation = round(Mean_Pearson_Correlation, 3),
+            Mean_Spearman_Correlation = round(Mean_Spearman_Correlation, 3)
+        )
+
+  # Create complete pairwise comparison table
+    pairwise_complete <- niche_overlap_results %>%
+        arrange(desc(Warrens_I)) %>%
+        mutate(
+            Species_Pair = paste(Species1_Full, "vs", Species2_Full)
+        ) %>%
+        dplyr::select(
+            Species_Pair,
+            Species1,
+            Species2,
+            Warrens_I,
+            Schoeners_D,
+            Pearson_Correlation,
+            Spearman_Correlation
+        )
+
+  # Save all results
+    write.csv(pairwise_complete, 
+              file.path(output_dir, "niche_overlap_all_pairs.csv"), 
+              row.names = FALSE)
+    
+    write.csv(comparison_summary, 
+              file.path(output_dir, "species_overlap_summary.csv"), 
+              row.names = FALSE)
+    
+    write.csv(importance_comparison, 
+              file.path(output_dir, "variable_importance_comparison.csv"), 
+              row.names = FALSE)
+
+  # Print summary results
+    print(comparison_summary)
+    print(pairwise_complete)
+  
+  # Quick summary statistics
+    cat("Highest niche overlap (Warren's I):", 
+        pairwise_complete$Species_Pair[1], "=", pairwise_complete$Warrens_I[1], "\n")
+    cat("Lowest niche overlap (Warren's I):", 
+        pairwise_complete$Species_Pair[nrow(pairwise_complete)], "=", 
+        pairwise_complete$Warrens_I[nrow(pairwise_complete)], "\n")
+    cat("Mean Warren's I across all pairs:", 
+        round(mean(pairwise_complete$Warrens_I), 3), "\n")
+
+  # Set output directory for figures
+    output_dir <- "OUTPUT DIRECTORY"
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Prepare complete matrix data (including diagonal)
+    matrix_data <- map_dfr(target_species, function(sp1) {
+        map_dfr(target_species, function(sp2) {
+            if (sp1 == sp2) {
+                # Diagonal - perfect overlap
+                  tibble(
+                      Species1 = sp1,
+                      Species2 = sp2,
+                      Warrens_I = 1.0,
+                      Schoeners_D = 1.0,
+                      Pearson_Correlation = 1.0,
+                      Spearman_Correlation = 1.0
+                  )
+            } else {
+                # Find the corresponding pair in niche_overlap_results
+                  pair_data <- niche_overlap_results %>%
+                      filter((Species1 == sp1 & Species2 == sp2) | 
+                             (Species1 == sp2 & Species2 == sp1))
+                
+                if (nrow(pair_data) > 0) {
+                    tibble(
+                        Species1 = sp1,
+                        Species2 = sp2,
+                        Warrens_I = pair_data$Warrens_I[1],
+                        Schoeners_D = pair_data$Schoeners_D[1],
+                        Pearson_Correlation = pair_data$Pearson_Correlation[1],
+                        Spearman_Correlation = pair_data$Spearman_Correlation[1]
+                    )
+                }
+            }
+        })
+    }) %>%
+        filter(!is.na(Warrens_I))
+
+  # Function to create matrix plot with values
+    create_matrix_plot <- function(data, metric_col, title, colors) {
+        ggplot(data, aes(x = Species1, y = Species2, fill = !!sym(metric_col))) +
+            geom_tile(color = "white", size = 0.5) +
+            geom_text(aes(label = round(!!sym(metric_col), 3)), 
+                     color = "white", size = 4, fontface = "bold") +
+            scale_fill_gradientn(
+                colors = colors,
+                name = "",
+                limits = c(0, 1),
+                breaks = c(0, 0.25, 0.5, 0.75, 1.0)
+            ) +
+            labs(title = title) +
+            theme_minimal() +
+            theme(
+                axis.title = element_blank(),
+                axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+                axis.text.y = element_text(size = 10),
+                panel.grid = element_blank(),
+                plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+                legend.position = "right",
+                legend.key.height = unit(1, "cm"),
+                legend.key.width = unit(0.5, "cm"),
+                panel.background = element_rect(fill = "transparent"),
+                plot.background = element_rect(fill = "transparent", color = NA)
+            ) +
+            coord_fixed()
+    }
+
+  # Define color schemes (all blue-green variations, light to dark)
+    warrens_colors <- c("#E3F3FF", "#C5E3FF", "#A7D3FF", "#89C2FF", "#6BB2FF", "#4C9FFF", "#2378D4", "#13539A", "#103D66", "#10243D")
+    schoeners_colors <- c("#EAE6F8", "#C8C4EB", "#A7A3DF", "#8883D3", "#6C66C7", "#584FB0", "#463C96", "#372D7A", "#28205C", "#18133E")
+    pearson_colors <- c("#E7FFF3", "#C4F9E3", "#A0F4D2", "#7DEFC2", "#59E8B0", "#36E19E", "#24B37B", "#187D59", "#145C43", "#0A3325")
+    spearman_colors <- c("#F6FFE3", "#E7FFB9", "#D7FF8B", "#C8FF5E", "#B6EA35", "#A3D126", "#84A91C", "#668214", "#475C0C", "#293605")
+  
+  # Create the four matrices
+    warrens_plot <- create_matrix_plot(matrix_data, "Warrens_I", 
+                                       "Warren's I", warrens_colors)
+    
+    schoeners_plot <- create_matrix_plot(matrix_data, "Schoeners_D", 
+                                     "Schoener's D", schoeners_colors)
+    
+    pearson_plot <- create_matrix_plot(matrix_data, "Pearson_Correlation", 
+                                     "Pearson Correlation", pearson_colors)
+    
+    spearman_plot <- create_matrix_plot(matrix_data, "Spearman_Correlation", 
+                                      "Spearman Correlation", spearman_colors)
+```
+
+
+
