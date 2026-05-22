@@ -39,8 +39,8 @@ This repository contains all data, code, and associated files for a community ec
 
 ### Distribution-Modeled Species (≥30 presence records)
 
-Seven species met the minimum occurrence threshold for boosted regression tree modeling:
-*Dermacentor reticulatus*, *D. marginatus*, *Haemaphysalis parva*, *Ha. punctata*, *Ha. inermis*, *Ixodes ricinus*, and one additional *Rhipicephalus* species.
+Six species met the minimum occurrence threshold for boosted regression tree modeling:
+*Dermacentor reticulatus*, *D. marginatus*, *Haemaphysalis parva*, *Ha. punctata*, *Ha. inermis* and *Ixodes ricinus*.
 
 ## Repository Structure
 
