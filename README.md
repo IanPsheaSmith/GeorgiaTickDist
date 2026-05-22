@@ -82,11 +82,10 @@ Both dataset types include matched environmental covariates extracted at each oc
 
 Multi-band GeoTIFF raster stacks covering the national extent of Georgia with all environmental predictors used in the distribution models. Covariates include:
 
-- Temperature variables (mean annual, seasonality; WorldClim v2)
-- Precipitation variables (mean annual, seasonality; WorldClim v2)
 - NDVI (Normalized Difference Vegetation Index; MODIS MOD13A3)
 - Elevation (digital elevation model)
 - Land cover classes
+- Temperature & precipitation are downloaded directly into R using the _geodata_ package
 
 **Raster Specifications:**
 - Coordinate system: WGS84
@@ -103,16 +102,16 @@ Soil property rasters sourced from SoilGrids 2.0 (Poggio et al., 2021), cropped 
 All analyses are implemented in `Georgia_Ticks_Biodiv.Rmd` and are fully reproducible. The workflow includes four primary analytical components:
 
 **1. Biodiversity Metrics**
-Species richness and community diversity were quantified using Shannon's Diversity Index, Gini-Simpson Diversity, Pielou's Evenness, Simpson's Dominance, and Berger-Parker Dominance. Whittaker rank-abundance curves were generated alongside rarefaction analyses using the Chao1 and first-order Jackknife estimators (via the `iNEXT` package) to assess sampling completeness.
+Species richness and community diversity were quantified using Gini-Simpson Diversity alongside rarefaction analyses using the Chao1 and first-order Jackknife estimators (via the `iNEXT` package) to assess sampling completeness.
 
 **2. Bioregionalization**
-Occurrence points were aggregated into 25 cluster-defined sites using k-means clustering (elbow plot optimized). Spatially constrained hierarchical clustering was then implemented using the `ClustGeo` package (Chavent et al., 2021), integrating both Jaccard dissimilarity and haversine-based spatial distance matrices to define discrete tick bioregions. Bioregion differences were evaluated using ANOVA across environmental covariates, and indicator species were identified using IndVal analysis (Dufrêne & Legendre, 1997; 9,999 permutations).
+Occurrence points were aggregated into 25 clusters using k-means clustering. Spatially constrained hierarchical clustering was then implemented using the `ClustGeo` package (Chavent et al., 2021), integrating both Jaccard dissimilarity and haversine-based spatial distance matrices to define discrete tick bioregions. Bioregion differences were evaluated using ANOVA across environmental covariates, and indicator species were identified using IndVal analysis (Dufrêne & Legendre, 1997; 9,999 permutations).
 
 **3. Species Co-occurrence Networks**
 Two co-occurrence network types were constructed from the site-species matrix: a probabilistic co-occurrence network (Veech, 2013; `cooccur` package) and a simple count-based co-occurrence network. Niche overlap between modeled species was quantified using Schoener's D and Warren's I statistics.
 
 **4. Species Distribution Models**
-Boosted regression trees (BRTs) were fit for all seven species with ≥30 presence records using the `dismo` and `gbm` packages. Model parameters: 5,000 trees, interaction depth = 10, learning rate = 0.001, with 10-fold cross-validation. Each species dataset was partitioned into training (75%) and testing (25%) sets. Model performance was evaluated using RMSE and AUC. Partial dependence plots were generated for all covariates to characterize species-environment relationships, and spatial predictions of habitat suitability were projected across Georgia.
+Boosted regression trees (BRTs) were fit for all six species with ≥30 presence records using the `dismo` and `gbm` packages. Model parameters: 5,000 trees, interaction depth = 10, learning rate = 0.001, with 10-fold cross-validation. Each species dataset was partitioned into training (75%) and testing (25%) sets. Model performance was evaluated using RMSE and AUC. Partial dependence plots were generated for all covariates to characterize species-environment relationships, and spatial predictions of habitat suitability were projected across Georgia.
 
 ## Usage
 
